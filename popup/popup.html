@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meet Budy</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Reset & Base ─────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg-base:      #1a0820;
+      --bg-card:      #2a0d36;
+      --bg-surface:   #3a1248;
+      --bg-hover:     #481a58;
+      --border-color: rgba(255, 255, 255, 0.04);
+      --accent:       #c77dff;
+      --accent-bright:#e0aaff;
+      --accent-dim:   #4a1d5e;
+      --border-active:#c77dff;
+      --stat-pink:    #e0aaff;
+      --stat-vip:     #c77dff;
+
+      --text-primary: #f5e6ff;
+      --text-muted:   #b89ec8;
+      --text-dim:     #6b4d7a;
+      
+      --green:        #22c55e;
+      --red:          #ef4444;
+      
+      --radius-sm:    6px;
+      --radius-md:    12px;
+      --radius-lg:    18px;
+      --radius-xl:    22px;
+    }
+
+    html { width: 380px; }
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg-base);
+      color: var(--text-primary);
+      width: 380px;
+      min-width: 380px;
+      height: 560px;
+      max-height: 560px;
+      padding: 14px;
+      margin: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--accent-dim) transparent;
+    }
+    body::-webkit-scrollbar { width: 6px; }
+    body::-webkit-scrollbar-thumb { background: var(--accent-dim); border-radius: 3px; }
+
+    /* ── Top Control Card ─────────────────────────── */
+    .top-control-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .controls-left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    /* Record Button (Solid Circle) */
+    .btn-record-circle {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+    }
+    .btn-record-circle.recording {
+      background: var(--red);
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.08); opacity: 0.8; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+
+    /* Stop square icon — hidden by default, shown when recording */
+    .btn-record-circle .symbol {
+      display: none;
+    }
+    .btn-record-circle.recording .symbol {
+      display: block;
+      width: 11px;
+      height: 11px;
+      background: #ffffff;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    /* Control Icons (Pause/Reload) */
+    .btn-control-icon {
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px;
+      transition: all 0.2s ease;
+      opacity: 0.95;
+    }
+    .btn-control-icon:hover {
+      transform: scale(1.1);
+      color: var(--accent);
+    }
+    .btn-control-icon:active {
+      transform: scale(0.9);
+    }
+    .btn-control-icon:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    .timer-display {
+      font-size: 34px;
+      font-weight: 500;
+      color: var(--text-primary);
+      line-height: 1;
+      letter-spacing: 0.5px;
+    }
+
+    /* Stats & Menu Row */
+    .stats-menu-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+      padding-top: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+    }
+
+    .stats-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    .stats-left span {
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .stats-menu-row { flex-wrap: nowrap; gap: 10px; }
+    .menu-right { white-space: nowrap; }
+    .stats-left strong {
+      color: var(--stat-pink);
+      margin-left: 6px;
+      font-weight: 700;
+    }
+    .stats-left .vip-label strong { color: var(--stat-vip); }
+    .stats-left .vip-label { color: var(--accent); }
+
+    .menu-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .menu-link {
+      color: var(--text-muted);
+      text-decoration: none;
+      cursor: pointer;
+      transition: color 0.2s;
+    }
+    .menu-link:hover {
+      color: var(--text-primary);
+    }
+    .menu-link.active {
+      color: var(--accent);
+    }
+
+    #logContainer {
+      font-family: 'JetBrains Mono', Consolas, monospace;
+      font-size: 10px;
+      color: var(--text-muted);
+      max-height: 240px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      padding: 8px;
+      background: rgba(0, 0, 0, 0.25);
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-color);
+    }
+    #logContainer::-webkit-scrollbar { width: 6px; }
+    #logContainer::-webkit-scrollbar-thumb { background: var(--accent-dim); border-radius: 3px; }
+    .settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 4px;
+      border-bottom: 1px solid var(--border-color);
+    }
+    .settings-row:last-child { border-bottom: none; }
+    .settings-row .label { font-size: 12px; color: var(--text-primary); font-weight: 500; }
+    .settings-row .hint  { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
+    .settings-row .col-text { display: flex; flex-direction: column; }
+
+    /* ── Toggles 2x2 Grid ─────────────────────────── */
+    .grid-cards {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .toggle-card {
+      background: var(--bg-card);
+      border: 2px solid transparent;
+      border-radius: var(--radius-xl);
+      padding: 14px 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transition: all 0.2s ease;
+    }
+    .toggle-card.active {
+      border-color: var(--border-active);
+      background: var(--bg-card);
+      box-shadow: 0 0 0 1px rgba(199,125,255,0.25) inset;
+    }
+
+    .card-icon-wrapper {
+      width: 44px;
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-dim);
+      flex-shrink: 0;
+    }
+    .toggle-card.active .card-icon-wrapper {
+      color: var(--accent-bright);
+    }
+
+    .card-right {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex: 1;
+      min-width: 0;
+    }
+    .card-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-dim);
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+    }
+    .toggle-card.active .card-label {
+      color: var(--text-primary);
+    }
+
+    /* Custom Switch Toggle with Rounded Rect Knob */
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 46px;
+      height: 22px;
+    }
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background-color: var(--accent-dim);
+      border-radius: 6px;
+      transition: all 0.2s ease;
+    }
+    .slider::before {
+      content: "";
+      position: absolute;
+      height: 14px;
+      width: 18px; /* Rounded rect knob width */
+      left: 4px;
+      bottom: 4px;
+      background-color: var(--text-dim);
+      border-radius: 3px; /* Pill-like rounded rect knob */
+      transition: all 0.2s ease;
+    }
+    .switch input:checked + .slider {
+      background-color: var(--accent);
+    }
+    .switch input:checked + .slider::before {
+      transform: translateX(20px);
+      background-color: #ffffff;
+    }
+
+    /* ── Accordions ──────────────────────────────── */
+    .accordion {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      transition: all 0.2s ease;
+    }
+    .accordion.disabled-panel {
+      opacity: 0.3;
+      pointer-events: none;
+      border-color: transparent;
+    }
+
+    .accordion-header {
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .header-left svg {
+      color: var(--text-muted);
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .btn-circle-add {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      transition: all 0.2s;
+    }
+    .btn-circle-add:hover {
+      color: var(--accent);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .accordion-arrow {
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      transition: transform 0.2s ease;
+    }
+    .accordion.collapsed .accordion-arrow {
+      transform: rotate(-90deg);
+    }
+
+    .accordion-content {
+      padding: 8px 16px 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.02);
+      display: block;
+    }
+    .accordion.collapsed .accordion-content {
+      display: none;
+    }
+
+    /* ── Item lists (2-col grid, 1fr each) ──────── */
+    .pills-container {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .empty-state {
+      grid-column: 1 / -1;
+      font-size: 11px;
+      color: var(--text-dim);
+      text-align: center;
+      padding: 8px 4px;
+    }
+
+    /* Shared pill base */
+    .track-pill, .vip-pill {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.2s;
+      min-width: 0;
+      width: 100%;
+    }
+    .track-pill:hover, .vip-pill:hover {
+      background: var(--bg-hover);
+      border-color: var(--accent);
+    }
+    .track-pill .name, .vip-pill .name {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .vip-pill.alt-layout { flex-direction: row-reverse; }
+    .track-pill.alt-layout { flex-direction: row-reverse; }
+    .track-pill.alt-layout .name { text-align: right; }
+
+    /* Badge slot — shows number normally, X on hover */
+    .pill-badge {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: var(--bg-base);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 700;
+      flex-shrink: 0;
+      position: relative;
+      transition: background 0.15s;
+    }
+    .pill-badge .badge-x {
+      display: none;
+      position: absolute;
+      inset: 0;
+      align-items: center;
+      justify-content: center;
+    }
+    .track-pill:hover .pill-badge,
+    .vip-pill:hover .pill-badge { background: var(--red); }
+    .track-pill:hover .pill-badge .badge-num,
+    .vip-pill:hover .pill-badge .badge-num { visibility: hidden; }
+    .track-pill:hover .pill-badge .badge-x,
+    .vip-pill:hover .pill-badge .badge-x { display: flex; }
+
+    /* VIP avatar lives in the badge slot when not hovered */
+    .vip-pill .pill-badge.with-avatar { background: transparent; padding: 0; overflow: hidden; }
+    .vip-pill .pill-badge img {
+      width: 100%; height: 100%; border-radius: 50%; object-fit: cover;
+    }
+    .vip-pill:hover .pill-badge.with-avatar { background: var(--red); }
+    .vip-pill:hover .pill-badge.with-avatar img { display: none; }
+
+    /* ── Popups / Modals ─────────────────────────── */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.65);
+      backdrop-filter: blur(3px);
+      z-index: 1000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      animation: fadeIn 0.15s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .modal-overlay.visible { display: flex; }
+    .modal {
+      background: var(--bg-card);
+      border: 1px solid rgba(199,125,255,0.18);
+      border-radius: var(--radius-lg);
+      padding: 0;
+      width: 100%;
+      max-width: 340px;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.55), 0 0 0 1px rgba(199,125,255,0.05);
+      overflow: hidden;
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border-color);
+    }
+    .modal-title {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--text-primary);
+    }
+    .modal-close {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      width: 24px; height: 24px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.15s;
+    }
+    .modal-close:hover { color: var(--text-primary); background: var(--bg-surface); }
+    .modal-body {
+      padding: 12px 16px;
+      max-height: 60vh;
+      overflow-y: auto;
+    }
+    .modal-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .modal-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      transition: background 0.15s;
+      cursor: pointer;
+    }
+    .modal-item:hover { background: var(--bg-surface); }
+    .modal-item .label { color: var(--text-primary); }
+    .modal-item .sub  { color: var(--text-muted); font-size: 10px; }
+    .modal-item input[type=checkbox] {
+      appearance: none;
+      width: 18px; height: 18px;
+      border: 2px solid var(--text-dim);
+      border-radius: 4px;
+      cursor: pointer;
+      flex-shrink: 0;
+      position: relative;
+      transition: all 0.15s;
+    }
+    .modal-item input[type=checkbox]:checked {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .modal-item input[type=checkbox]:checked::after {
+      content: '';
+      position: absolute;
+      left: 4px; top: 1px;
+      width: 5px; height: 9px;
+      border: solid var(--bg-base);
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    .modal-divider {
+      height: 1px;
+      background: var(--border-color);
+      margin: 8px 0;
+    }
+    .modal-section-title {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      padding: 4px 10px 2px;
+    }
+    .modal-footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--border-color);
+    }
+    .btn-text {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 8px 14px;
+      border-radius: var(--radius-sm);
+      transition: all 0.15s;
+    }
+    .btn-text:hover { color: var(--text-primary); background: var(--bg-surface); }
+    .btn-text.accent { color: var(--accent); }
+    .btn-text.danger { color: var(--red); }
+
+    /* ── Footer ──────────────────────────────────── */
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--text-muted);
+      margin-top: auto;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255, 255, 255, 0.02);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ── Top Control Card ────────────────────────────────────── -->
+  <div class="top-control-card">
+    <div class="top-row">
+      <div class="controls-left">
+        <!-- Circle Record Button -->
+        <button id="btnRecord" class="btn-record-circle idle" title="Start Recording">
+          <div class="symbol"></div>
+        </button>
+        <!-- Pause / Resume Button -->
+        <button id="btnPause" class="btn-control-icon" title="Pause Recording" disabled>
+          <!-- SVG Pause Icon -->
+          <svg id="svgPause" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="4" x2="6" y2="20"></line><line x1="14" y1="4" x2="14" y2="20"></line></svg>
+          <!-- SVG Resume (Play) Icon -->
+          <svg id="svgResume" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="display: none;"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+        </button>
+        <!-- Reload Button -->
+        <button id="btnStatus" class="btn-control-icon" title="Reload Streams & Voices">
+          <!-- SVG Reload Icon -->
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+        </button>
+      </div>
+      <!-- Timer display -->
+      <div id="timerDisplay" class="timer-display">00:00:00</div>
+    </div>
+
+    <!-- Stats & Menu Row -->
+    <div class="stats-menu-row">
+      <div class="stats-left">
+        <span>STREAM :<strong id="statStream">0</strong></span>
+        <span>VOICES :<strong id="statVoices">0</strong></span>
+        <span class="vip-label">VIP :<strong id="statVips">0</strong></span>
+      </div>
+      <div class="menu-right">
+        <span id="linkSettings" class="menu-link">Settings</span>
+        <span id="linkLogs" class="menu-link">Logs</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Settings Modal ──────────────────────────────────────── -->
+  <div id="panelSettings" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">Settings</div>
+        <button class="modal-close" data-close="panelSettings" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-row">
+          <div class="col-text">
+            <span class="label">Advance Mode</span>
+            <span class="hint">Expose per-participant track routing</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="toggleAdvanceMode" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="settings-row">
+          <div class="col-text">
+            <span class="label">Re-inject Recorder</span>
+            <span class="hint">Use after Meet reloads if detection stops</span>
+          </div>
+          <button id="btnReinject" class="btn-text accent">Inject</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Logs Modal ──────────────────────────────────────────── -->
+  <div id="panelLogs" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">System Logs</div>
+        <button class="modal-close" data-close="panelLogs" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="logContainer">
+          <div style="color: var(--text-dim);">[System] Meet Budy active</div>
+        </div>
+        <div id="statusMsg" style="font-size: 10px; color: var(--text-muted); text-align: center; margin-top: 8px;">Ready</div>
+      </div>
+      <div class="modal-footer">
+        <button id="logClear" class="btn-text danger">Clear logs</button>
+        <button class="btn-text accent" data-close="panelLogs">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Toggles 2x2 Grid ────────────────────────────────────── -->
+  <div class="grid-cards">
+    <!-- YOUR MIC Card -->
+    <div id="cardMyMic" class="toggle-card">
+      <div class="card-icon-wrapper">
+        <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V21h-2a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-3.08A7 7 0 0 0 19 11Z"/></svg>
+      </div>
+      <div class="card-right">
+        <div class="card-label">YOUR MIC</div>
+        <label class="switch">
+          <input type="checkbox" id="toggleMyMic" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- VOICEs Card -->
+    <div id="cardVoices" class="toggle-card">
+      <div class="card-icon-wrapper">
+        <svg width="34" height="30" viewBox="0 0 32 24" fill="currentColor"><circle cx="10" cy="8" r="5"/><circle cx="22" cy="9" r="4"/><path d="M2 22c0-4.4 3.6-8 8-8s8 3.6 8 8v1H2v-1Z"/><path d="M18.5 14.2A6.97 6.97 0 0 1 22 13c4.4 0 8 3 8 7v3H20v-1c0-2.7-.7-5-1.5-6.8Z"/></svg>
+      </div>
+      <div class="card-right">
+        <div class="card-label">VOICEs</div>
+        <label class="switch">
+          <input type="checkbox" id="toggleVoices" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- VIPs Card -->
+    <div id="cardVips" class="toggle-card">
+      <div class="card-icon-wrapper">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="currentColor"><path d="M11 1h2v2h2v2h-2v2h-2V5H9V3h2V1Z"/><path d="M3 9l3.5 3L12 7l5.5 5L21 9l-1.5 10h-15L3 9Zm1.8 11h14.4v2H4.8v-2Z"/></svg>
+      </div>
+      <div class="card-right">
+        <div class="card-label">VIPs</div>
+        <label class="switch">
+          <input type="checkbox" id="toggleVips" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- STREAMs Card -->
+    <div id="cardStreams" class="toggle-card">
+      <div class="card-icon-wrapper">
+        <svg width="34" height="30" viewBox="0 0 32 24" fill="currentColor"><rect x="1" y="4" width="20" height="16" rx="3"/><path d="M23 10l7-5v14l-7-5v-4Z"/></svg>
+      </div>
+      <div class="card-right">
+        <div class="card-label">STREAMs</div>
+        <label class="switch">
+          <input type="checkbox" id="toggleStreams" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Audio Tracks Accordion ────────────────────────────── -->
+  <div id="accordionAudio" class="accordion collapsed">
+    <div class="accordion-header" id="headerAudio">
+      <div class="header-left">
+        <!-- Waveform Icon -->
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10v4M6 6v12M9 10v4M12 4v16M15 10v4M18 6v12M21 10v4"/></svg>
+        Audio Tracks
+      </div>
+      <div class="header-right">
+        <button id="btnAddTrack" class="btn-circle-add" title="Add Audio Track">+</button>
+        <div class="accordion-arrow">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+      </div>
+    </div>
+    <div class="accordion-content">
+      <div id="trackList" class="pills-container">
+        <!-- Filled dynamically -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ── VIPs Accordion ──────────────────────────────────────── -->
+  <div id="accordionVips" class="accordion collapsed">
+    <div class="accordion-header" id="headerVips">
+      <div class="header-left">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M11 0h2v2h2v2h-2v2h-2V4H9V2h2V0Z"/><path d="M2 7l4 3 6-5 6 5 4-3-2 11H4L2 7Zm2 13h16v2H4v-2Z"/></svg>
+        VIPs
+      </div>
+      <div class="header-right">
+        <button id="btnAddVip" class="btn-circle-add" title="Add VIP">+</button>
+        <div class="accordion-arrow">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+      </div>
+    </div>
+    <div class="accordion-content">
+      <div id="vipList" class="pills-container">
+        <!-- Filled dynamically -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Track Editor Modal ──────────────────────────────────── -->
+  <div id="modalTrack" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title" id="modalTrackTitle">Edit Audio Track</div>
+        <button class="modal-close" data-close="modalTrack" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-list" id="modalTrackList"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnDeleteTrack" class="btn-text danger" style="display: none;">Delete track</button>
+        <button id="btnCancelTrack" class="btn-text accent" style="margin-left: auto;">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── VIP Picker Modal ────────────────────────────────────── -->
+  <div id="modalVip" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">Select VIPs</div>
+        <button class="modal-close" data-close="modalVip" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-list" id="modalVipList"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnCancelVip" class="btn-text accent" style="margin-left: auto;">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Footer ──────────────────────────────────────────────── -->
+  <!-- Pending Combine Modal -->
+  <div id="modalCombine" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">Combine Encoding</div>
+        <button class="modal-close" data-close="modalCombine" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="combinePromptText" style="font-size: 12px; line-height: 1.5; color: var(--text-primary);">
+          Combined encoding is ready. Do you want to run it now?
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnCombineNever" class="btn-text danger">Never</button>
+        <button id="btnCombineLater" class="btn-text">Later</button>
+        <button id="btnCombineNow" class="btn-text accent">Do it</button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="footer">
+    <span>Meet Budy - by SeeSatya</span>
+    <span>V1.0.0</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
