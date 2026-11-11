@@ -52,10 +52,16 @@
   const activeScreenShareTracks = [];
   let screenShareTrack          = null;
   let forceNoScreenShare        = false; // user override: treat canvas as no screenshare
+  const probeDisposers          = new Map(); // trackId → idempotent probe disposal
+  const observedTrackListeners  = new Map();
+  const observedTrackOwners     = new Map(); // trackId → receiving peers
+  const peerTrackIds            = new WeakMap();
+  let trackSweepId = null;
   const videoProbes             = new Map(); // trackId → <video> element
   const domVideoElements        = new Map(); // trackId → Meet-owned <video> element
   let lastScreenShareDomScan    = 0;
 
+  let activeRecordingSession = null; // Owns startup, outputs and finalization until fully drained.
   let mediaRecorder     = null;
   let isRecording       = false;
   let recordMimeType    = '';
@@ -176,6 +182,7 @@
       req.onerror   = () => reject(req.error);
       tx.oncomplete = () => resolve();
       tx.onerror    = () => reject(tx.error);
+      tx.onabort    = () => reject(tx.error || new Error('Chunk transaction aborted'));
     });
   }
 
@@ -199,23 +206,32 @@
 
   function ensureAudioCtx() {
     if (!audioCtx || audioCtx.state === 'closed') {
-      audioCtx = new AudioContext();
-
-      // Build Track 1 node chain
-      audioDestNode = audioCtx.createMediaStreamDestination();
-      recordingGainNode = audioCtx.createGain(); // Track 1 gate
-      recordingGainNode.gain.setValueAtTime(0, audioCtx.currentTime);
-      recordingGainNode.connect(audioDestNode);
-
-      const track1Mixer = audioCtx.createGain(); // Track 1 mixer
-      track1Mixer.gain.setValueAtTime(1, audioCtx.currentTime);
-      track1Mixer.connect(recordingGainNode);
-
-      trackMixers.set(1, track1Mixer);
-      trackDestNodes.set(1, audioDestNode);
-      trackGains.set(1, recordingGainNode);
-
-      console.log('[MeetRecorder] AudioContext created and audio graph initialized');
+      let context, destination, gate, mixer;
+      try {
+        context = new AudioContext();
+        destination = context.createMediaStreamDestination();
+        gate = context.createGain();
+        gate.gain.setValueAtTime(0, context.currentTime);
+        gate.connect(destination);
+        mixer = context.createGain();
+        mixer.gain.setValueAtTime(1, context.currentTime);
+        mixer.connect(gate);
+        // Publish only a complete root graph. A failed setup must be retryable.
+        audioCtx = context;
+        audioDestNode = destination;
+        recordingGainNode = gate;
+        trackMixers.set(1, mixer);
+        trackDestNodes.set(1, destination);
+        trackGains.set(1, gate);
+      } catch (err) {
+        [mixer, gate].forEach(node => { try { node?.disconnect(); } catch (_) {} });
+        destination?.stream.getTracks().forEach(track => { try { track.stop(); } catch (_) {} });
+        try { context?.close().catch(() => {}); } catch (_) {}
+        audioCtx = null;
+        audioDestNode = null;
+        recordingGainNode = null;
+        throw err;
+      }
     }
     if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
     return { audioCtx, audioDestNode };
@@ -223,37 +239,32 @@
 
   function ensureTrackNodes(trackId) {
     if (!audioCtx) return null;
-
-    // Return existing nodes
     if (trackMixers.has(trackId)) {
-      return {
-        destNode:  trackDestNodes.get(trackId),
-        gateNode:  trackGains.get(trackId),
-        mixerNode: trackMixers.get(trackId),
-      };
+      return { destNode: trackDestNodes.get(trackId), gateNode: trackGains.get(trackId), mixerNode: trackMixers.get(trackId) };
     }
-
-    // Build new chain for track 2+
-    const destNode  = audioCtx.createMediaStreamDestination();
-    const gateNode  = audioCtx.createGain();
-    const mixerNode = audioCtx.createGain();
-
-    gateNode.gain.setValueAtTime(0, audioCtx.currentTime); // silent until recording
-    mixerNode.gain.setValueAtTime(1, audioCtx.currentTime);
-
-    mixerNode.connect(gateNode);
-    gateNode.connect(destNode);
-
-    trackMixers.set(trackId, mixerNode);
-    trackGains.set(trackId, gateNode);
-    trackDestNodes.set(trackId, destNode);
-
-    console.log(`[MeetRecorder] Created mixer→gate→dest chain for track ${trackId}`);
-    return { destNode, gateNode, mixerNode };
+    let destNode, gateNode, mixerNode;
+    try {
+      destNode = audioCtx.createMediaStreamDestination();
+      gateNode = audioCtx.createGain();
+      mixerNode = audioCtx.createGain();
+      gateNode.gain.setValueAtTime(0, audioCtx.currentTime);
+      mixerNode.gain.setValueAtTime(1, audioCtx.currentTime);
+      mixerNode.connect(gateNode);
+      gateNode.connect(destNode);
+      trackMixers.set(trackId, mixerNode);
+      trackGains.set(trackId, gateNode);
+      trackDestNodes.set(trackId, destNode);
+      return { destNode, gateNode, mixerNode };
+    } catch (err) {
+      [mixerNode, gateNode].forEach(node => { try { node?.disconnect(); } catch (_) {} });
+      destNode?.stream.getTracks().forEach(track => { try { track.stop(); } catch (_) {} });
+      throw err;
+    }
   }
 
   function reconcileCustomTrackNodes() {
     const liveIds = new Set(customAudioTracks.map(track => track.id));
+    activeRecordingSession?.outputs.forEach(track => liveIds.add(track.id));
     liveIds.add(1);
 
     trackMixers.forEach((mixerNode, trackId) => {
@@ -274,7 +285,6 @@
       trackMixers.delete(trackId);
       trackGains.delete(trackId);
       trackDestNodes.delete(trackId);
-      secondaryRecorders.delete(trackId);
       console.log(`[MeetRecorder] Pruned stale custom audio track nodes for track ${trackId}`);
     });
   }
@@ -294,7 +304,7 @@
     }
 
     // 3. For each custom track, route the appropriate sources into its MIXER node
-    customAudioTracks.forEach(track => {
+    recordingAudioTracks().forEach(track => {
       const nodes = ensureTrackNodes(track.id);
       if (!nodes) return;
 
@@ -409,6 +419,8 @@
 
       console.log('[MeetRecorder] Local microphone connected to recording and volume monitoring active');
     } catch (err) {
+      removeLocalMicTrack();
+      currentLocalMicTrack = null;
       console.error('[MeetRecorder] Error adding local mic track:', err);
     }
   }
@@ -491,6 +503,7 @@
       // muted so we don't double-play audio that Meet is already rendering.
       const primingStream = new MediaStream([track]);
       const sink = document.createElement('audio');
+      trackSinkEls.set(track.id, sink);
       sink.srcObject = primingStream;
       sink.muted = true;
       sink.autoplay = true;
@@ -498,15 +511,12 @@
       sink.style.cssText = 'position:fixed;width:0;height:0;opacity:0;pointer-events:none;left:-9999px;top:-9999px;';
       (document.body || document.documentElement).appendChild(sink);
       sink.play().catch(() => {});
-      trackSinkEls.set(track.id, sink);
 
       const src = audioCtx.createMediaStreamSource(primingStream);
-      const gainNode = audioCtx.createGain();
-      
-      src.connect(gainNode);
-
       audioSources.set(track.id, src);
+      const gainNode = audioCtx.createGain();
       trackGainNodes.set(track.id, gainNode);
+      src.connect(gainNode);
 
       // Tap the analyser off the SAME source node.
       monitorAudioTrack(track, src);
@@ -517,6 +527,7 @@
 
       console.log(`[MeetRecorder] Track ${track.id} connected and routed`);
     } catch (err) {
+      disconnectAudioTrack(track.id);
       console.error('[MeetRecorder] connectAndMonitorAudioTrack error:', err);
     }
   }
@@ -532,7 +543,9 @@
     lastResolveTime.delete(trackId);
     trackCorrelation.delete(trackId);
     participantTileCache.delete(`track:${trackId}`);
-    if (streamId) participantTileCache.delete(streamId);
+    if (streamId && !Array.from(trackStreamMap.values()).includes(streamId)) {
+      participantTileCache.delete(streamId);
+    }
     const an = trackAnalysers.get(trackId);
     if (an) {
       try { an.analyser.disconnect(); } catch (_) {}
@@ -558,7 +571,9 @@
     }
     audioLevels.delete(trackId);
     forgetTrack(trackId);
-    rebuildAudioGraph();
+    try { rebuildAudioGraph(); } catch (err) {
+      console.warn('[MeetRecorder] Audio graph rebuild failed during teardown:', err);
+    }
   }
 
   function monitorAudioTrack(track, sourceNode) {
@@ -572,6 +587,7 @@
     try {
       const { audioCtx } = ensureAudioCtx();
       const analyser = audioCtx.createAnalyser();
+      trackAnalysers.set(track.id, { analyser, dataArray: null, track });
       analyser.fftSize = 64;
       sourceNode.connect(analyser);
       trackAnalysers.set(track.id, {
@@ -581,7 +597,10 @@
       });
       ensureVolumePoll();
     } catch (err) {
-      console.error('[MeetRecorder] monitorAudioTrack error:', err);
+      const entry = trackAnalysers.get(track.id);
+      try { entry?.analyser.disconnect(); } catch (_) {}
+      trackAnalysers.delete(track.id);
+      throw err;
     }
   }
 
@@ -594,9 +613,7 @@
       trackAnalysers.forEach((entry, trackId) => {
         const { analyser, dataArray, track } = entry;
         if (track.readyState !== 'live') {
-          audioLevels.delete(trackId);
-          try { analyser.disconnect(); } catch (_) {}
-          trackAnalysers.delete(trackId);
+          removeObservedTrack(trackId);
           return;
         }
         analyser.getByteFrequencyData(dataArray);
@@ -632,22 +649,83 @@
     volumePollId = setTimeout(tick, 100);
   }
 
+  function observeTrackLifetime(track) {
+    if (!observedTrackListeners.has(track.id)) {
+      const onEnded = () => removeObservedTrack(track.id);
+      observedTrackListeners.set(track.id, { track, onEnded });
+      track.addEventListener('ended', onEnded);
+    }
+    ensureTrackSweep();
+  }
+
+  // stop() does not dispatch ended. Reconcile independently of recording and
+  // analyser setup, so paused recordings and video-only calls also retire tracks.
+  function ensureTrackSweep() {
+    if (trackSweepId !== null) return;
+    const sweep = () => {
+      trackSweepId = null;
+      audioTracks.forEach(track => {
+        if (track.readyState !== 'live') removeObservedTrack(track.id);
+      });
+      allVideoTracks.slice().forEach(track => {
+        if (track.readyState !== 'live') removeObservedTrack(track.id);
+      });
+      domVideoElements.forEach((video, id) => {
+        if (!video.isConnected) domVideoElements.delete(id);
+      });
+      if (currentLocalMicTrack && currentLocalMicTrack.readyState !== 'live') {
+        removeLocalMicTrack();
+        currentLocalMicTrack = null;
+      }
+      if (audioTracks.size || allVideoTracks.length) ensureTrackSweep();
+    };
+    trackSweepId = setTimeout(sweep, 1000);
+  }
+
+  function removeObservedTrack(trackId) {
+    const listener = observedTrackListeners.get(trackId);
+    if (listener) {
+      listener.track.removeEventListener('ended', listener.onEnded);
+      observedTrackListeners.delete(trackId);
+    }
+    const owners = observedTrackOwners.get(trackId);
+    owners?.forEach(pc => peerTrackIds.get(pc)?.delete(trackId));
+    observedTrackOwners.delete(trackId);
+
+    const wasAudio = audioTracks.delete(trackId);
+    if (wasAudio || audioSources.has(trackId) || trackSinkEls.has(trackId)) {
+      disconnectAudioTrack(trackId);
+      if (wasAudio) postOut('AUDIO_TRACK_REMOVED', { trackId, total: audioTracks.size });
+    }
+    probeDisposers.get(trackId)?.();
+    const idx = allVideoTracks.findIndex(track => track.id === trackId);
+    if (idx !== -1) allVideoTracks.splice(idx, 1);
+    domVideoElements.delete(trackId);
+    const screenIdx = activeScreenShareTracks.findIndex(track => track.id === trackId);
+    if (screenIdx !== -1) activeScreenShareTracks.splice(screenIdx, 1);
+    if (screenShareTrack?.id === trackId) {
+      screenShareTrack = activeScreenShareTracks[activeScreenShareTracks.length - 1] || null;
+      if (screenShareTrack) {
+        postOut('SCREEN_SHARE_DETECTED', { trackId: screenShareTrack.id, method: 'fallback_active_track' });
+      } else {
+        postOut('SCREEN_SHARE_ENDED', { trackId, reason: 'track_retired' });
+      }
+    }
+    forgetTrack(trackId);
+    if (!audioTracks.size && !allVideoTracks.length && trackSweepId !== null) {
+      clearTimeout(trackSweepId);
+      trackSweepId = null;
+    }
+  }
+
   function addAudioTrack(track) {
+    if (track.readyState !== 'live') { removeObservedTrack(track.id); return; }
     if (audioTracks.has(track.id)) return;
     audioTracks.set(track.id, track);
-
-    // Always connect immediately — even before recording starts.
-    // The master recordingGainNode is 0 when not recording so nothing leaks into output.
-    // This pre-warms the AudioContext and ensures tracks are wired when Record is clicked.
+    observeTrackLifetime(track);
+    // Prewarm one source and muted sink per live remote track; Stop keeps these.
     connectAndMonitorAudioTrack(track);
-
     postOut('AUDIO_TRACK_ADDED', { trackId: track.id, total: audioTracks.size });
-
-    track.addEventListener('ended', () => {
-      audioTracks.delete(track.id);
-      disconnectAudioTrack(track.id);
-      postOut('AUDIO_TRACK_REMOVED', { trackId: track.id, total: audioTracks.size });
-    });
   }
 
   // ─── Screen Share Detection & Handling ─────────────────────────────────────
@@ -784,8 +862,12 @@
       vid.removeEventListener('resize', check);
       if (vid.isConnected) vid.remove();
       vid.srcObject = null;
-      videoProbes.delete(track.id);
+      track.removeEventListener('ended', cleanupProbe);
+      timers = [];
+      if (videoProbes.get(track.id) === vid) videoProbes.delete(track.id);
+      if (probeDisposers.get(track.id) === cleanupProbe) probeDisposers.delete(track.id);
     };
+    probeDisposers.set(track.id, cleanupProbe);
     
     vid.play().catch(() => {});
 
@@ -823,39 +905,19 @@
     }, 15000);
     timers.push(finalTimer);
 
-    track.addEventListener('ended', () => {
-      cleanupProbe();
-      videoProbes.delete(track.id);
-    });
+    track.addEventListener('ended', cleanupProbe);
   }
 
   function addVideoTrack(track) {
+    if (track.readyState !== 'live') { removeObservedTrack(track.id); return; }
     if (allVideoTracks.find(t => t.id === track.id)) return;
     allVideoTracks.push(track);
+    observeTrackLifetime(track);
     postOut('VIDEO_TRACK_RECEIVED', {
       trackId: track.id, contentHint: track.contentHint,
       label: track.label, total: allVideoTracks.length,
     });
-
     probeVideoTrack(track);
-
-    track.addEventListener('ended', () => {
-      const idx = allVideoTracks.findIndex(t => t.id === track.id);
-      if (idx !== -1) allVideoTracks.splice(idx, 1);
-      domVideoElements.delete(track.id);
-      
-      const sIdx = activeScreenShareTracks.indexOf(track);
-      if (sIdx !== -1) activeScreenShareTracks.splice(sIdx, 1);
-      
-      if (screenShareTrack?.id === track.id) {
-        if (activeScreenShareTracks.length > 0) {
-          screenShareTrack = activeScreenShareTracks[activeScreenShareTracks.length - 1];
-          postOut('SCREEN_SHARE_DETECTED', { trackId: screenShareTrack.id, method: 'fallback_active_track' });
-        } else {
-          clearScreenShare('track_ended', track.id);
-        }
-      }
-    });
   }
 
   function rescanExistingMediaElements() {
@@ -893,21 +955,37 @@
   // ─── RTCPeerConnection Patch & Tracker ─────────────────────────────────────
   const OrigPeerConn = window.RTCPeerConnection;
 
+  function retirePeerConnection(pc) {
+    activePeerConnections.delete(pc);
+    const ids = peerTrackIds.get(pc);
+    peerTrackIds.delete(pc);
+    ids?.forEach(trackId => {
+      const owners = observedTrackOwners.get(trackId);
+      owners?.delete(pc);
+      if (!owners?.size) removeObservedTrack(trackId);
+    });
+    updateLocalMicSource();
+  }
+
   function patchPeerConnection(pc) {
     activePeerConnections.add(pc);
-
+    peerTrackIds.set(pc, new Set());
     pc.addEventListener('connectionstatechange', () => {
-      if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
-        activePeerConnections.delete(pc);
+      // ICE failure can recover through restart with the same live receivers.
+      // Keep their first audio source, priming sink and sender visibility intact.
+      if (pc.connectionState === 'closed') {
+        retirePeerConnection(pc);
       }
     });
-
     pc.addEventListener('track', (event) => {
       const { track, streams } = event;
-      if (streams && streams[0]) {
-        trackStreamMap.set(track.id, streams[0].id);
-      }
-      if (track.kind === 'audio')      addAudioTrack(track);
+      if (track.readyState !== 'live' || !activePeerConnections.has(pc)) return;
+      let owners = observedTrackOwners.get(track.id);
+      if (!owners) observedTrackOwners.set(track.id, owners = new Set());
+      owners.add(pc);
+      peerTrackIds.get(pc).add(track.id);
+      if (streams?.[0]) trackStreamMap.set(track.id, streams[0].id);
+      if (track.kind === 'audio') addAudioTrack(track);
       else if (track.kind === 'video') addVideoTrack(track);
     });
   }
@@ -932,8 +1010,9 @@
   if (OrigPeerConn.prototype && typeof OrigPeerConn.prototype.close === 'function') {
     const origClose = OrigPeerConn.prototype.close;
     OrigPeerConn.prototype.close = function() {
-      activePeerConnections.delete(this);
-      return origClose.apply(this, arguments);
+      const result = origClose.apply(this, arguments);
+      retirePeerConnection(this);
+      return result;
     };
   }
 
@@ -2013,6 +2092,7 @@
   // ─── Compositor Loop Helpers ────────────────────────────────────────────────
   function startCompositorLoop(callback) {
     stopCompositorLoop();
+    let workerUrl = null;
     try {
       const workerCode = `
         let timer = null;
@@ -2025,337 +2105,333 @@
           }
         };
       `;
-      const blob = new Blob([workerCode], { type: 'application/javascript' });
-      const workerUrl = URL.createObjectURL(blob);
+      workerUrl = URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' }));
       timerWorker = new Worker(workerUrl);
-      timerWorker.onmessage = (e) => {
-        if (e.data === 'tick') {
-          callback();
-        }
-      };
+      timerWorker.onmessage = e => { if (e.data === 'tick') callback(); };
       timerWorker.postMessage('start');
-      console.log('[MeetRecorder] Compositor loop started via Web Worker timer');
-      URL.revokeObjectURL(workerUrl);
     } catch (err) {
-      console.warn('[MeetRecorder] Web Worker timer creation failed, falling back to page-level setInterval:', err);
+      stopCompositorLoop();
+      console.warn('[MeetRecorder] Worker timer unavailable; using page timer:', err);
       canvasIntervalId = setInterval(callback, 1000 / 30);
+    } finally {
+      if (workerUrl) URL.revokeObjectURL(workerUrl);
     }
   }
 
   function stopCompositorLoop() {
     if (timerWorker) {
-      try {
-        timerWorker.postMessage('stop');
-        timerWorker.terminate();
-      } catch (_) {}
+      try { timerWorker.postMessage('stop'); } catch (_) {}
+      try { timerWorker.terminate(); } catch (_) {}
+      timerWorker.onmessage = null;
       timerWorker = null;
     }
-    if (canvasIntervalId) {
+    if (canvasIntervalId !== null) {
       clearInterval(canvasIntervalId);
       canvasIntervalId = null;
     }
-    console.log('[MeetRecorder] Compositor loop stopped');
   }
 
-  function cleanupRecordingResources() {
-    stopCompositorLoop();
+  function recordingAudioTracks() {
+    return activeRecordingSession?.outputs || customAudioTracks;
+  }
 
-    if (mediaRecorder) {
-      mediaRecorder.ondataavailable = null;
-      mediaRecorder.onerror = null;
-      mediaRecorder.onstop = null;
-      mediaRecorder = null;
+  function closeRecordingGates() {
+    if (!audioCtx) return;
+    trackGains.forEach(node => {
+      try { node.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05); } catch (_) {}
+    });
+  }
+
+  function releaseSessionCapture(session) {
+    session.kickNodes.forEach(node => { try { node.disconnect(); } catch (_) {} });
+    session.kickNodes.length = 0;
+    if (session.canvasStream) {
+      session.canvasStream.getTracks().forEach(track => { try { track.stop(); } catch (_) {} });
+      session.canvasStream = null;
     }
+    session.canvas = null;
+    session.context = null;
+    if (activeRecordingSession === session) {
+      recordingCanvasStream = null;
+      canvasElement = null;
+      canvasCtx = null;
+    }
+  }
 
-    secondaryRecorders.forEach(entry => {
-      if (!entry?.recorder) return;
+  function cleanupRecordingResources(session = activeRecordingSession) {
+    if (!session || session.disposed) return;
+    session.disposed = true;
+    session.recorders.forEach(entry => {
       entry.recorder.ondataavailable = null;
       entry.recorder.onerror = null;
       entry.recorder.onstop = null;
     });
-    secondaryRecorders.clear();
-
-    if (recordingCanvasStream) {
-      try { recordingCanvasStream.getTracks().forEach(track => track.stop()); } catch (_) {}
+    releaseSessionCapture(session);
+    // A retired callback must never act on a later session's projection.
+    if (activeRecordingSession === session) {
+      stopCompositorLoop();
+      closeRecordingGates();
+      isRecording = false;
+      removeLocalMicTrack();
+      currentLocalMicTrack = null;
+      mediaRecorder = null;
+      secondaryRecorders.clear();
       recordingCanvasStream = null;
+      canvasElement = null;
+      canvasCtx = null;
+      isResolutionLocked = false;
+      activeRecordingSession = null;
+      // Preparing the next configuration is independent of completion of this
+      // saved session. Allocation failure must not suppress its download catalog.
+      try {
+        reconcileCustomTrackNodes();
+        rebuildAudioGraph();
+      } catch (err) {
+        postOut('WARN', `Next recording audio graph setup failed: ${err.message}`);
+      }
     }
+  }
 
-    canvasElement = null;
-    canvasCtx = null;
-    isResolutionLocked = false;
+  function persistRecordingChunk(session, entry, blob) {
+    if (!blob || blob.size === 0 || session.disposed) return;
+    const write = writeChunkToDB(entry.recordingId, blob).then(() => {
+      entry.chunksSaved++;
+      entry.bytesSaved += blob.size;
+      if (entry === session.main) {
+        chunksSaved = entry.chunksSaved;
+        bytesSaved = entry.bytesSaved;
+        postOut('CHUNK_SAVED', {
+          recordingId: session.id,
+          count: entry.chunksSaved,
+          totalMB: (entry.bytesSaved / 1_048_576).toFixed(2),
+        });
+      }
+    }).catch(err => {
+      session.writeFailed = true;
+      postOut('ERROR', `Chunk save failed (${entry.recordingId}): ${err?.message || err}`);
+    });
+    session.writes.add(write);
+    write.then(() => session.writes.delete(write));
+  }
+
+  function bindSessionRecorder(session, recorder, output, mimeType, main = false) {
+    let resolveStopped;
+    const entry = {
+      recorder, trackId: output.id, name: output.name, mimeType,
+      recordingId: main ? session.id : `${session.id}__t${output.id}`,
+      chunksSaved: 0, bytesSaved: 0, started: false, stopped: false,
+      stoppedPromise: new Promise(resolve => { resolveStopped = resolve; }),
+    };
+    entry.markStopped = () => {
+      if (entry.stopped) return;
+      entry.stopped = true;
+      resolveStopped();
+    };
+    session.recorders.push(entry);
+    recorder.ondataavailable = event => persistRecordingChunk(session, entry, event.data);
+    recorder.onstop = () => {
+      entry.markStopped();
+      if (main) finalizeRecording(session);
+    };
+    recorder.onerror = event => {
+      postOut('ERROR', `Recorder ${entry.recordingId} error: ${event.error?.message || 'unknown'}`);
+      // A recorder error emits final data/stop; preserve handlers until that drain.
+      finalizeRecording(session);
+    };
+    return entry;
+  }
+
+  function stopSessionRecorder(entry) {
+    if (!entry.started) { entry.markStopped(); return; }
+    if (entry.recorder.state !== 'inactive') {
+      // requestData may throw independently of stop. Never let it skip stop.
+      try { entry.recorder.requestData(); } catch (_) {}
+      try { entry.recorder.stop(); } catch (err) {
+        postOut('WARN', `Recorder stop failed (${entry.recordingId}): ${err.message}`);
+        // Chrome can race an already-queued native stop; its final event still owns
+        // completion. If it is genuinely still active, preserve its handle to retry.
+        if (entry.recorder.state !== 'inactive') {
+          try { entry.recorder.stop(); } catch (_) {}
+        }
+      }
+    }
+  }
+
+  function finalizeRecording(session = activeRecordingSession) {
+    if (!session) {
+      postOut('RECORDING_IDLE', { reason: 'recorder-not-active' });
+      return Promise.resolve();
+    }
+    if (session.finalization) return session.finalization;
+    session.state = 'finalizing';
+    if (activeRecordingSession === session) {
+      isRecording = false;
+      stopCompositorLoop();
+      closeRecordingGates();
+      removeLocalMicTrack();
+      currentLocalMicTrack = null;
+    }
+    // Reserve the promise before stop(): test fixtures and native callbacks may
+    // report onstop synchronously/reentrantly.
+    let finish;
+    session.finalization = new Promise(resolve => { finish = resolve; });
+    session.recorders.forEach(stopSessionRecorder);
+    (async () => {
+      await Promise.all(session.recorders.map(entry => entry.stoppedPromise));
+      // Native capture can retire once final media events arrive, even when
+      // storage is slow. Keep session identity/handlers until accepted writes drain.
+      releaseSessionCapture(session);
+      while (session.writes.size) await Promise.all(Array.from(session.writes));
+      const main = session.main;
+      const data = {
+        recordingId: session.id,
+        mimeType: session.mimeType,
+        totalChunks: main?.chunksSaved || 0,
+        totalMB: ((main?.bytesSaved || 0) / 1_048_576).toFixed(2),
+        writeFailed: session.writeFailed,
+        secondaries: session.recorders.filter(entry => entry !== main && entry.started).map(entry => ({
+          trackId: entry.trackId, name: entry.name, recordingId: entry.recordingId,
+          mimeType: entry.mimeType, chunks: entry.chunksSaved,
+          mb: (entry.bytesSaved / 1_048_576).toFixed(2),
+        })),
+      };
+      cleanupRecordingResources(session);
+      if (session.started) postOut('RECORDING_STOPPED', data);
+      else postOut('RECORDING_IDLE', { reason: 'startup-cancelled-or-failed', recordingId: session.id });
+      finish();
+    })().catch(err => {
+      postOut('ERROR', `Recording cleanup failed: ${err.message}`);
+      cleanupRecordingResources(session);
+      finish();
+    });
+    return session.finalization;
   }
 
   // ─── Recording Pipeline ────────────────────────────────────────────────────
-  async function startRecording() {
-    if (isRecording) { postOut('WARN', 'Already recording'); return; }
-    if (!currentRecordId) { postOut('ERROR', 'No recordingId — start aborted'); return; }
-
-    // ALWAYS lock resolution at start! Canvas resizing mid-recording breaks MediaRecorder completely.
-    isResolutionLocked = true;
-    lockedWidth = 1920;
-    lockedHeight = 1080;
-
-    if (!forceNoScreenShare && screenShareTrack && screenShareTrack.readyState === 'live') {
-      const probeVid = getVideoElementForScreenShare(screenShareTrack.id);
-      if (probeVid && probeVid.videoWidth > 0 && probeVid.videoHeight > 0) {
-        lockedWidth = probeVid.videoWidth;
-        lockedHeight = probeVid.videoHeight;
-        console.log(`[MeetRecorder] Resolution locked to pre-existing screenshare: ${lockedWidth}x${lockedHeight}`);
+  async function startRecording(recordingId = currentRecordId) {
+    if (activeRecordingSession) { postOut('WARN', 'Recording is starting, active or finalizing'); return; }
+    if (!recordingId) { postOut('ERROR', 'No recordingId — start aborted'); return; }
+    const session = {
+      id: recordingId, state: 'starting', outputs: customAudioTracks.map(track => ({
+        ...track, targets: Array.from(track.targets || []),
+      })),
+      recorders: [], main: null, writes: new Set(), kickNodes: [],
+      started: false, writeFailed: false, disposed: false,
+    };
+    // Synchronous reservation precedes allocation and the first await.
+    activeRecordingSession = session;
+    currentRecordId = session.id;
+    try {
+      isResolutionLocked = true;
+      lockedWidth = 1920;
+      lockedHeight = 1080;
+      if (!forceNoScreenShare && screenShareTrack?.readyState === 'live') {
+        const video = getVideoElementForScreenShare(screenShareTrack.id);
+        if (video?.videoWidth > 0 && video.videoHeight > 0) {
+          lockedWidth = video.videoWidth;
+          lockedHeight = video.videoHeight;
+        }
       }
-    }
-
-    canvasElement = document.createElement('canvas');
-    canvasElement.width = lockedWidth;
-    canvasElement.height = lockedHeight;
-    canvasCtx = canvasElement.getContext('2d');
-
-    recordMimeType = getBestMime();
-    chunksSaved    = 0;
-    bytesSaved     = 0;
-
-    openIDB().catch(err => postOut('ERROR', `IDB pre-open failed: ${err.message}`));
-
-    // ── Audio Setup ─────────────────────────────────────────────────────────
-    // Tracks are ALREADY connected to the audio graph (ensureAudioCtx was called
-    // when each track arrived in addAudioTrack). The master recordingGainNode
-    // is at 0 — we just need to resume the AudioContext and flip it to 1.
-    const { audioCtx: ctx, audioDestNode: destNode } = ensureAudioCtx();
-
-    // Resume AudioContext (it was pre-created when tracks arrived, may be suspended)
-    if (ctx.state === 'suspended') {
-      try {
-        await ctx.resume();
-        postOut('INFO', 'AudioContext resumed ✓');
-      } catch (err) {
-        postOut('WARN', `AudioContext resume failed: ${err.message}`);
-      }
-    }
-    postOut('INFO', `AudioContext state: ${ctx.state} | Connected tracks: ${audioSources.size}`);
-
-    // Open gates (0 → 1) for all configured tracks to start audio flowing
-    const targetGain = isRecordingMuted ? 0 : 1;
-    customAudioTracks.forEach(track => {
-      const nodes = ensureTrackNodes(track.id);
-      if (nodes && nodes.gateNode) {
+      session.canvas = document.createElement('canvas');
+      session.canvas.width = lockedWidth;
+      session.canvas.height = lockedHeight;
+      session.context = session.canvas.getContext('2d');
+      if (!session.context) throw new Error('Canvas context unavailable');
+      canvasElement = session.canvas;
+      canvasCtx = session.context;
+      session.mimeType = recordMimeType = getBestMime();
+      chunksSaved = bytesSaved = 0;
+      openIDB().catch(err => postOut('ERROR', `IDB pre-open failed: ${err.message}`));
+      const { audioCtx: ctx, audioDestNode: destNode } = ensureAudioCtx();
+      if (ctx.state === 'suspended') await ctx.resume();
+      // STOP can dispose this startup while AudioContext.resume is pending.
+      if (activeRecordingSession !== session || session.state !== 'starting') return;
+      // A failed next-configuration preparation may have left source gains
+      // disconnected. Accept startup only after every output is routed again.
+      reconcileCustomTrackNodes();
+      rebuildAudioGraph();
+      session.outputs.forEach(track => {
+        const nodes = ensureTrackNodes(track.id);
+        nodes?.gateNode.gain.setTargetAtTime(isRecordingMuted ? 0 : 1, ctx.currentTime, 0.05);
+      });
+      if (ctx.state === 'running') {
         try {
-          nodes.gateNode.gain.setTargetAtTime(targetGain, ctx.currentTime, 0.05);
-          postOut('INFO', `Recording gate opened for track ${track.id} (${track.name}) → gain=${targetGain} ✓`);
-        } catch (_) {}
+          const oscillator = ctx.createOscillator();
+          session.kickNodes.push(oscillator);
+          const gain = ctx.createGain();
+          session.kickNodes.push(gain);
+          gain.gain.value = 0;
+          oscillator.connect(gain);
+          gain.connect(destNode);
+          oscillator.onended = () => {
+            try { oscillator.disconnect(); } catch (_) {}
+            try { gain.disconnect(); } catch (_) {}
+            session.kickNodes = session.kickNodes.filter(node => node !== oscillator && node !== gain);
+            oscillator.onended = null;
+          };
+          oscillator.start();
+          oscillator.stop(ctx.currentTime + 0.1);
+        } catch (err) {
+          session.kickNodes.forEach(node => { try { node.disconnect(); } catch (_) {} });
+          session.kickNodes.length = 0;
+          postOut('WARN', `AudioContext kickstart failed: ${err.message}`);
+        }
       }
-    });
-
-    // Kickstart AudioContext graph to ensure MediaRecorder gets initial data
-    if (ctx.state === 'running') {
-      try {
-        const kickOsc = ctx.createOscillator();
-        const kickGain = ctx.createGain();
-        kickGain.gain.value = 0; // completely silent
-        kickOsc.connect(kickGain);
-        kickGain.connect(destNode);
-        kickOsc.start();
-        kickOsc.stop(ctx.currentTime + 0.1);
-      } catch (err) {
-        console.warn('[MeetRecorder] AudioContext kickstart failed:', err);
-      }
-    }
-
-    // Connect local mic if enabled
-    updateLocalMicSource();
-
-    // ── Stream Assembly ──────────────────────────────────────────────────────
-    const tracks = [];
-
-    try {
-      recordingCanvasStream = canvasElement.captureStream(30);
-      const canvasTrack = recordingCanvasStream.getVideoTracks()[0];
-      if (canvasTrack) {
-        tracks.push(canvasTrack);
-        postOut('INFO', 'Video channel bound to canvas compositor ✓');
-      } else {
-        throw new Error('Canvas captureStream returned no video tracks');
-      }
-    } catch (err) {
-      postOut('ERROR', `Compositor initialization failed: ${err.message}`);
-      cleanupRecordingResources();
-      return;
-    }
-
-    // ── Main recorder: video + track #1 audio (the "everything" file) ──
-    const primaryTrack = customAudioTracks[0] || { id: 1, name: 'EVERYONE' };
-    const primaryNodes = ensureTrackNodes(primaryTrack.id);
-    if (primaryNodes && primaryNodes.destNode) {
-      const destTracks = primaryNodes.destNode.stream.getAudioTracks();
-      if (destTracks.length > 0) {
-        tracks.push(destTracks[0]);
-        postOut('INFO', `Primary audio (track ${primaryTrack.id} ${primaryTrack.name}) bound ✓`);
-      } else {
-        postOut('WARN', `Primary track ${primaryTrack.id} destination has 0 audio tracks`);
-      }
-    }
-
-    const stream = new MediaStream(tracks);
-    postOut('INFO', `Main stream: ${stream.getVideoTracks().length} video, ${stream.getAudioTracks().length} audio`);
-
-    try {
+      session.canvasStream = session.canvas.captureStream(30);
+      recordingCanvasStream = session.canvasStream;
+      const videoTrack = session.canvasStream.getVideoTracks()[0];
+      if (!videoTrack) throw new Error('Canvas captureStream returned no video tracks');
+      const primary = session.outputs[0] || { id: 1, name: 'EVERYONE' };
+      const primaryAudio = ensureTrackNodes(primary.id)?.destNode.stream.getAudioTracks() || [];
+      const stream = new MediaStream([videoTrack, ...primaryAudio.slice(0, 1)]);
       mediaRecorder = new MediaRecorder(stream, {
-        mimeType: recordMimeType,
-        videoBitsPerSecond: 3_000_000,
-        audioBitsPerSecond: 128_000,
+        mimeType: session.mimeType, videoBitsPerSecond: 3_000_000, audioBitsPerSecond: 128_000,
+      });
+      session.main = bindSessionRecorder(session, mediaRecorder, primary, session.mimeType, true);
+      const audioMime = MediaRecorder.isTypeSupported(AUDIO_ONLY_MIME) ? AUDIO_ONLY_MIME : 'audio/webm';
+      session.outputs.slice(1).forEach(track => {
+        let entry;
+        try {
+          const audioTracks = ensureTrackNodes(track.id)?.destNode.stream.getAudioTracks() || [];
+          if (!audioTracks.length) return;
+          const recorder = new MediaRecorder(new MediaStream([audioTracks[0]]), {
+            mimeType: audioMime, audioBitsPerSecond: 128_000,
+          });
+          entry = bindSessionRecorder(session, recorder, track, audioMime);
+          secondaryRecorders.set(track.id, entry);
+        } catch (err) {
+          entry?.markStopped();
+          postOut('ERROR', `Secondary recorder init failed (${track.id}): ${err.message}`);
+        }
+      });
+      session.main.recorder.start(2000);
+      session.main.started = true;
+      session.started = true;
+      session.recorders.filter(entry => entry !== session.main).forEach(entry => {
+        try {
+          entry.recorder.start(2000);
+          entry.started = true;
+        } catch (err) {
+          entry.markStopped();
+          postOut('ERROR', `Secondary recorder start failed (${entry.trackId}): ${err.message}`);
+        }
+      });
+      session.state = 'recording';
+      isRecording = true;
+      updateLocalMicSource();
+      startCompositorLoop(drawCompositorFrame);
+      postOut('RECORDING_STARTED', {
+        mimeType: session.mimeType, hasVideo: true, hasAudio: stream.getAudioTracks().length > 0,
+        audioSources: audioSources.size, recordingId: session.id,
       });
     } catch (err) {
-      postOut('ERROR', `MediaRecorder init failed: ${err.message}`);
-      cleanupRecordingResources();
-      return;
+      postOut('ERROR', `Recording startup failed: ${err.message}`);
+      await finalizeRecording(session);
     }
-
-    // ── Secondary recorders: one audio-only file per remaining track ──
-    secondaryRecorders.clear();
-    const audioMime = MediaRecorder.isTypeSupported(AUDIO_ONLY_MIME)
-      ? AUDIO_ONLY_MIME
-      : 'audio/webm';
-    customAudioTracks.slice(1).forEach(track => {
-      const nodes = ensureTrackNodes(track.id);
-      if (!nodes || !nodes.destNode) return;
-      const audioTracks_ = nodes.destNode.stream.getAudioTracks();
-      if (audioTracks_.length === 0) {
-        postOut('WARN', `Secondary track ${track.id} (${track.name}) has 0 audio tracks`);
-        return;
-      }
-      const secStream = new MediaStream([audioTracks_[0]]);
-      let secRecorder;
-      try {
-        secRecorder = new MediaRecorder(secStream, { mimeType: audioMime, audioBitsPerSecond: 128_000 });
-      } catch (err) {
-        postOut('ERROR', `Secondary recorder init failed (track ${track.id}): ${err.message}`);
-        return;
-      }
-      const secRecordingId = `${currentRecordId}__t${track.id}`;
-      const entry = { recorder: secRecorder, recordingId: secRecordingId, name: track.name, mimeType: audioMime, chunksSaved: 0, bytesSaved: 0 };
-      secRecorder.ondataavailable = (event) => {
-        if (!event.data || event.data.size === 0) return;
-        const blob = event.data;
-        writeChunkToDB(secRecordingId, blob)
-          .then(() => {
-            entry.chunksSaved++;
-            entry.bytesSaved += blob.size;
-          })
-          .catch(err => {
-            console.error('[MeetRecorder] Secondary chunk save error:', err);
-            postOut('ERROR', `Track ${track.id} chunk save failed: ${err?.message || err}`);
-          });
-      };
-      secRecorder.onerror = (event) => {
-        postOut('ERROR', `Secondary recorder ${track.id} error: ${event.error?.message || 'unknown'}`);
-      };
-      secondaryRecorders.set(track.id, entry);
-      postOut('INFO', `Secondary audio recorder bound: track ${track.id} (${track.name}) → ${secRecordingId}`);
-    });
-
-    mediaRecorder.ondataavailable = (event) => {
-      if (!event.data || event.data.size === 0) return;
-      const rid = currentRecordId;
-      const blob = event.data;
-      writeChunkToDB(rid, blob)
-        .then(() => {
-          chunksSaved++;
-          bytesSaved += blob.size;
-          postOut('CHUNK_SAVED', {
-            count:   chunksSaved,
-            totalMB: (bytesSaved / 1_048_576).toFixed(2),
-          });
-        })
-        .catch(err => {
-          console.error('[MeetRecorder] Chunk pipeline error:', err);
-          postOut('ERROR', `Chunk save failed: ${err?.message || err}`);
-        });
-    };
-
-    mediaRecorder.onerror = (event) => {
-      postOut('ERROR', `MediaRecorder error: ${event.error?.message || 'unknown'}`);
-      isRecording = false;
-      if (audioCtx) {
-        trackGains.forEach(gainNode => {
-          try { gainNode.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05); } catch (_) {}
-        });
-      }
-      stopCompositorLoop();
-      updateLocalMicSource();
-      setTimeout(cleanupRecordingResources, 3000);
-    };
-
-    mediaRecorder.onstop = () => {
-      isRecording = false;
-      if (audioCtx) {
-        trackGains.forEach(gainNode => {
-          try { gainNode.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05); } catch (_) {}
-        });
-      }
-      stopCompositorLoop();
-      updateLocalMicSource();
-      const secondaries = [];
-      secondaryRecorders.forEach((entry, trackId) => {
-        secondaries.push({
-          trackId,
-          name: entry.name,
-          recordingId: entry.recordingId,
-          mimeType: entry.mimeType,
-          chunks: entry.chunksSaved,
-          mb: (entry.bytesSaved / 1_048_576).toFixed(2),
-        });
-      });
-      postOut('RECORDING_STOPPED', {
-        totalChunks: chunksSaved,
-        totalMB: (bytesSaved / 1_048_576).toFixed(2),
-        secondaries,
-      });
-      setTimeout(cleanupRecordingResources, 3000);
-    };
-
-    isRecording = true;
-    mediaRecorder.start(2000);
-    secondaryRecorders.forEach((entry, trackId) => {
-      try { entry.recorder.start(2000); } catch (err) {
-        postOut('ERROR', `Failed to start secondary recorder ${trackId}: ${err.message}`);
-      }
-    });
-    startCompositorLoop(drawCompositorFrame);
-
-    postOut('RECORDING_STARTED', {
-      mimeType:     recordMimeType,
-      hasVideo:     true,
-      hasAudio:     stream.getAudioTracks().length > 0,
-      audioSources: audioSources.size, // Push to popup so it doesn't need refresh
-      recordingId:  currentRecordId,
-    });
-
-    console.log(`[MeetRecorder] Recording started (id=${currentRecordId}, mime=${recordMimeType}, audioSources=${audioSources.size})`);
   }
 
   function stopRecording() {
-    if (!mediaRecorder || mediaRecorder.state === 'inactive') {
-      // The recorder is already dead (e.g. it errored out earlier) but the
-      // popup still thinks we're recording — clicking Stop otherwise no-ops
-      // forever. Tell the outside to reset to idle so the UI un-sticks.
-      postOut('WARN', 'Recorder not active');
-      isRecording = false;
-      stopCompositorLoop();
-      postOut('RECORDING_IDLE', { reason: 'recorder-not-active' });
-      return;
-    }
-    mediaRecorder.requestData();
-    mediaRecorder.stop();
-    secondaryRecorders.forEach((entry, trackId) => {
-      try {
-        if (entry.recorder.state !== 'inactive') {
-          entry.recorder.requestData();
-          entry.recorder.stop();
-        }
-      } catch (err) {
-        postOut('WARN', `Secondary recorder ${trackId} stop failed: ${err.message}`);
-      }
-    });
-    stopCompositorLoop();
-    updateLocalMicSource();
+    return finalizeRecording();
   }
 
   function pauseRecording() {
@@ -2402,13 +2478,12 @@
         }
         break;
       case 'START':
-        currentRecordId = recordingId || `rec_${Date.now()}`;
         if (bgUrl && bgImg.src !== bgUrl) {
           bgLoaded = false;
           bgImg.src = bgUrl;
           console.log('[MeetRecorder] Loading cozy background from START command');
         }
-        startRecording();
+        startRecording(recordingId || `rec_${Date.now()}`);
         break;
       case 'STOP':
         stopRecording();
@@ -2449,6 +2524,7 @@
         break;
       case 'SET_AUDIO_TRACKS':
         customAudioTracks = e.data.list || [];
+        if (activeRecordingSession) postOut('INFO', 'Audio output configuration will apply to the next recording');
         reconcileCustomTrackNodes();
         rebuildAudioGraph();
         console.log('[MeetRecorder] customAudioTracks set to:', customAudioTracks);

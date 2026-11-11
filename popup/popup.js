@@ -65,13 +65,17 @@
   const modalVip           = document.getElementById('modalVip');
   const modalVipList       = document.getElementById('modalVipList');
   const btnCancelVip       = document.getElementById('btnCancelVip');
-  const PENDING_COMBINE_KEY = 'meetBudyPendingCombine';
+  const PENDING_COMBINE_KEY = 'meetBudyPendingCombine:';
+  const pendingRecordingSelect = document.getElementById('pendingRecordingSelect');
 
   // ─── Constants ───────────────────────────────────────────────────────────
   const X_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
 
   // ─── State ───────────────────────────────────────────────────────────────
   let isRecording     = false;
+  let activeRecordingId = null;
+  let activeRecordingContextId = null;
+  let activeRecordingTabId = null;
   let isPausedState   = false;
   let hasScreenShare  = false;
   let audioSourcesCount = 0;
@@ -86,6 +90,8 @@
   let currentEditingTrackId = null;
   let pendingCombineJob = null;
   let pendingCombineTimer = null;
+  let pendingCombineJobs = [];
+  let pendingJobsLoad = 0;
 
   // ─── Track helpers ───────────────────────────────────────────────────────
   function renumberTracks() {
@@ -163,37 +169,63 @@
 
   function showCombinePrompt(job, text) {
     pendingCombineJob = job || pendingCombineJob;
-    if (!modalCombine) return;
-    if (combinePromptText && text) combinePromptText.textContent = text;
+    if (!modalCombine || !pendingCombineJob) return;
+    const cleanup = ['cleanup', 'cleanup_requested'].includes(pendingCombineJob.state);
+    const busy = pendingCombineJob.state === 'combining';
+    const recovery = !!pendingCombineJob.needsRawSave;
+    if (combinePromptText) combinePromptText.textContent = cleanup
+      ? 'Recording cleanup is pending. Retry to finish removing its saved copy.'
+      : busy ? 'This recording is being combined. You can cancel it and keep the raw files.'
+      : recovery ? (pendingCombineJob.writeFailed
+        ? 'Some recording data failed to save. Recover the saved portion or discard it; the file may be incomplete.'
+        : 'A saved recording can be recovered. Save it now or discard its saved data.')
+      : (text || 'Combined encoding is ready. Do you want to run it now?');
+    if (btnCombineNow) { btnCombineNow.textContent = cleanup ? 'Retry cleanup' : recovery ? 'Save recording' : 'Do it'; btnCombineNow.disabled = busy; }
+    if (btnCombineLater) btnCombineLater.disabled = cleanup || busy;
+    if (btnCombineNever) btnCombineNever.textContent = recovery ? 'Discard recording' : 'Keep raw files';
     modalCombine.classList.add('visible');
   }
-
-  function hideCombinePrompt() {
-    if (modalCombine) modalCombine.classList.remove('visible');
-  }
-
+  function hideCombinePrompt() { modalCombine?.classList.remove('visible'); }
   function scheduleCombineReminder(job, delayMs = 10 * 60 * 1000) {
     clearPendingCombineTimer();
     pendingCombineTimer = setTimeout(() => {
-      if (pendingCombineJob) {
-        showCombinePrompt(pendingCombineJob, 'Combined encoding is still pending. Do you want to run it now?');
-      }
+      pendingCombineTimer = null;
+      loadPendingCombineFromStorage();
     }, delayMs);
   }
-
   function loadPendingCombineFromStorage() {
-    chrome.storage.local.get(PENDING_COMBINE_KEY, (data) => {
-      const job = data[PENDING_COMBINE_KEY];
-      if (!job) return;
-      pendingCombineJob = job;
-      const dueNow = !job.nextPromptAt || Date.now() >= job.nextPromptAt;
-      if (dueNow) {
-        showCombinePrompt(job, 'Combined encoding is ready. Do you want to run it now?');
-      } else {
-        scheduleCombineReminder(job, Math.max(0, job.nextPromptAt - Date.now()));
+    const generation = ++pendingJobsLoad;
+    chrome.runtime.sendMessage({ type: 'JOB_STORE', action: 'list' }, response => {
+      if (chrome.runtime.lastError || !response?.ok || generation !== pendingJobsLoad) return;
+      pendingCombineJobs = (response.jobs || []).filter(job => !['preparing', 'recording'].includes(job.state));
+      pendingCombineJobs.sort((a, b) => (a.nextPromptAt || 0) - (b.nextPromptAt || 0) || a.createdAt - b.createdAt);
+      const selected = pendingCombineJobs.find(job => job.id === pendingCombineJob?.id);
+      const isDue = job => ['cleanup', 'cleanup_requested', 'combining'].includes(job.state) || !job.nextPromptAt || job.nextPromptAt <= Date.now();
+      const due = pendingCombineJobs.find(isDue);
+      pendingCombineJob = selected && isDue(selected) ? selected : due || selected || pendingCombineJobs[0] || null;
+      clearPendingCombineTimer();
+      if (pendingRecordingSelect) {
+        pendingRecordingSelect.innerHTML = '';
+        for (const job of pendingCombineJobs) {
+          const option = document.createElement('option');
+          option.value = job.id;
+          option.textContent = new Date(job.createdAt || Date.now()).toLocaleString() + (job.needsRawSave ? ' — recovery' : ' — combined file');
+          pendingRecordingSelect.appendChild(option);
+        }
+        pendingRecordingSelect.value = pendingCombineJob?.id || '';
+        pendingRecordingSelect.style.display = pendingCombineJobs.length > 1 ? '' : 'none';
       }
+      if (!pendingCombineJob) { hideCombinePrompt(); return; }
+      const delay = Math.max(0, (pendingCombineJob.nextPromptAt || 0) - Date.now());
+      if (delay && !['cleanup', 'cleanup_requested', 'combining'].includes(pendingCombineJob.state)) {
+        const earliest = pendingCombineJobs[0];
+        hideCombinePrompt(); scheduleCombineReminder(earliest, Math.max(0, (earliest.nextPromptAt || 0) - Date.now()));
+      } else showCombinePrompt(pendingCombineJob);
     });
   }
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && Object.keys(changes).some(key => key.startsWith(PENDING_COMBINE_KEY) || key === 'meetBudyPendingCombine')) loadPendingCombineFromStorage();
+  });
 
   // ─── Accordion Toggles ───────────────────────────────────────────────────
   function initAccordions() {
@@ -525,6 +557,7 @@
     isRecording = true;
     btnRecord.className = 'btn-record-circle recording';
     btnRecord.title = 'Stop Recording';
+    btnRecord.removeAttribute('disabled');
     btnPause.removeAttribute('disabled');
     
     if (isPausedState) {
@@ -540,6 +573,9 @@
 
   function exitRecordingUI() {
     isRecording = false;
+    activeRecordingId = null;
+    activeRecordingContextId = null;
+    activeRecordingTabId = null;
     isPausedState = false;
     btnRecord.className = 'btn-record-circle idle';
     btnRecord.title = 'Start Recording';
@@ -567,22 +603,44 @@
   }
 
   // ─── Message Listener (Relay from Tab) ──────────────────────────────────
+  function belongsToActiveRecording(payload) {
+    if (!isRecording) return true;
+    if (payload?.recordingId && activeRecordingId && payload.recordingId !== activeRecordingId) return false;
+    if (payload?.contextId && activeRecordingContextId && payload.contextId !== activeRecordingContextId) return false;
+    return true;
+  }
   chrome.runtime.onMessage.addListener((message) => {
     const { type, payload } = message;
 
     if (type === 'STATUS') {
       handleStatus(payload);
+    } else if (type === 'TAB_CLOSED') {
+      if (isRecording && payload?.tabId === activeRecordingTabId) {
+        exitRecordingUI();
+        resetTimer();
+        btnRecord.removeAttribute('disabled');
+        setMsg('Recording tab closed.', 'info');
+      }
     } else if (type === 'LOG') {
       addLog(payload.text, payload.level || 'info');
     } else if (type === 'CHUNK') {
+      if (!belongsToActiveRecording(payload)) return;
       totalChunks = payload.count;
       sizeMB = payload.totalMB;
       setMsg(`Recording • ${payload.count} chunks (${payload.totalMB} MB)`, 'info');
     } else if (type === 'AUDIO') {
+      if (!belongsToActiveRecording(payload)) return;
       audioSourcesCount = payload.sources;
       statVoices.textContent = payload.sources;
       addLog(`Audio sources updated: ${payload.sources}`, 'info');
     } else if (type === 'STATUS_RESPONSE') {
+      if (isRecording && payload.tabId !== null && payload.tabId !== undefined && payload.tabId === activeRecordingTabId) {
+        if (!payload.isRecording) {
+          exitRecordingUI(); resetTimer(); btnRecord.removeAttribute('disabled'); return;
+        }
+        activeRecordingContextId = payload.contextId || activeRecordingContextId;
+      }
+      if (!belongsToActiveRecording(payload)) return;
       // Stream detection stats
       hasScreenShare = !!payload.hasScreenShare;
       statStream.textContent = payload.hasScreenShare ? '1' : '0';
@@ -602,19 +660,32 @@
       saveState(); // Persist tab-reported state so next popup open is instant
 
       if (payload.isRecording) {
+        activeRecordingId = payload.recordingId || activeRecordingId;
+        activeRecordingContextId = payload.contextId || activeRecordingContextId;
+        activeRecordingTabId = payload.tabId ?? activeRecordingTabId;
         isPausedState = !!payload.isPaused;
         enterRecordingUI(startTime);
         setIsPausedUI(isPausedState);
       }
     } else if (type === 'PENDING_COMBINE') {
-      pendingCombineJob = payload?.job || payload || null;
-      showCombinePrompt(pendingCombineJob, 'Combined encoding is ready. Do you want to run it now?');
+      loadPendingCombineFromStorage();
     }
   });
 
   function handleStatus(payload) {
     if (!payload) return;
     const { state, message, data } = payload;
+    if (payload.scope === 'job') {
+      if (state === 'combine_pending') loadPendingCombineFromStorage();
+      if (isRecording) addLog(message || 'Saved recording updated', state === 'error' ? 'error' : 'info');
+      else setMsg(message || 'Saved recording updated', state === 'error' ? 'error' : 'info');
+      return;
+    }
+    if (!belongsToActiveRecording(payload)) return;
+    if (isRecording && payload.scope === 'page' && state === 'error') {
+      setMsg(message || 'Recorder reported an error', 'error');
+      return; // Only a terminal recording event retires live recorder controls.
+    }
 
     switch (state) {
       case 'ready':
@@ -634,6 +705,9 @@
         break;
 
       case 'recording':
+        activeRecordingId = payload.recordingId || activeRecordingId;
+        activeRecordingContextId = payload.contextId || activeRecordingContextId;
+        activeRecordingTabId = payload.tabId ?? activeRecordingTabId;
         isPausedState = false;
         enterRecordingUI(payload.startTime || null);
         setIsPausedUI(false);
@@ -641,9 +715,19 @@
         break;
 
       case 'paused':
+        activeRecordingId = payload.recordingId || activeRecordingId;
+        activeRecordingContextId = payload.contextId || activeRecordingContextId;
+        activeRecordingTabId = payload.tabId ?? activeRecordingTabId;
         isPausedState = true;
         enterRecordingUI(payload.startTime || null);
         setIsPausedUI(true);
+        break;
+
+      case 'stopped':
+        exitRecordingUI();
+        resetTimer();
+        btnRecord.removeAttribute('disabled');
+        setMsg(message || 'Recording stopped; saving output…', 'info');
         break;
 
       case 'stopping':
@@ -663,9 +747,7 @@
         break;
 
       case 'combine_pending':
-        pendingCombineJob = payload?.data || payload || pendingCombineJob;
-        showCombinePrompt(pendingCombineJob, 'Combined encoding is ready. Do you want to run it now?');
-        scheduleCombineReminder(pendingCombineJob, 10 * 60 * 1000);
+        loadPendingCombineFromStorage();
         setMsg('Combined encoding pending.', 'info');
         break;
 
@@ -695,7 +777,8 @@
         btnRecord.setAttribute('disabled', 'true');
         btnPause.setAttribute('disabled', 'true');
         setMsg('Stopping recording…', 'info');
-        chrome.runtime.sendMessage({ type: 'STOP_RECORDING' }, (resp) => {
+        chrome.runtime.sendMessage({ type: 'STOP_RECORDING', targetTabId: activeRecordingTabId,
+          recordingId: activeRecordingId, contextId: activeRecordingContextId }, (resp) => {
           if (chrome.runtime.lastError || !resp?.ok) {
             setMsg('❌ Could not reach Meet tab.', 'error');
             btnRecord.removeAttribute('disabled');
@@ -703,12 +786,14 @@
         });
       } else {
         // Start recording
+        btnRecord.setAttribute('disabled', 'true');
         setMsg('Starting recording…', 'info');
         syncTracksWithTab(); // send final tracks config
         syncVipsWithTab(); // send final VIPs list
         chrome.runtime.sendMessage({ type: 'START_RECORDING' }, (resp) => {
           if (chrome.runtime.lastError || !resp?.ok) {
-            setMsg('❌ Could not reach Meet tab. Make sure Google Meet is open.', 'error');
+            btnRecord.removeAttribute('disabled');
+            setMsg('❌ Could not start recording: ' + (resp?.error || 'make sure Google Meet is open'), 'error');
           }
         });
       }
@@ -719,7 +804,8 @@
       if (!isRecording) return;
       const type = isPausedState ? 'RESUME_RECORDING' : 'PAUSE_RECORDING';
       setMsg(`${isPausedState ? 'Resuming' : 'Pausing'} recording…`, 'info');
-      chrome.runtime.sendMessage({ type }, (resp) => {
+      chrome.runtime.sendMessage({ type, targetTabId: activeRecordingTabId,
+        recordingId: activeRecordingId, contextId: activeRecordingContextId }, (resp) => {
         if (chrome.runtime.lastError || !resp?.ok) {
           setMsg('❌ Could not reach Meet tab.', 'error');
         }
@@ -752,49 +838,50 @@
       });
     }
 
+    if (pendingRecordingSelect) {
+      pendingRecordingSelect.addEventListener('change', () => {
+        pendingCombineJob = pendingCombineJobs.find(job => job.id === pendingRecordingSelect.value) || null;
+        clearPendingCombineTimer();
+        showCombinePrompt(pendingCombineJob);
+      });
+    }
     if (btnCombineNow) {
       btnCombineNow.addEventListener('click', () => {
         if (!pendingCombineJob) return;
-        hideCombinePrompt();
-        clearPendingCombineTimer();
-        setMsg('Running combined encoding…', 'info');
-        chrome.runtime.sendMessage({ type: 'RUN_PENDING_COMBINE', job: pendingCombineJob }, (resp) => {
-          if (chrome.runtime.lastError || !resp?.ok) {
-            setMsg(`❌ Could not run combine: ${resp?.error || chrome.runtime.lastError?.message || 'unknown error'}`, 'error');
-          }
+        const job = pendingCombineJob;
+        const cleanup = ['cleanup', 'cleanup_requested'].includes(job.state);
+        hideCombinePrompt(); clearPendingCombineTimer();
+        setMsg(cleanup ? 'Finishing recording cleanup…' : 'Saving recording…', 'info');
+        chrome.runtime.sendMessage({ type: cleanup ? 'CANCEL_PENDING_COMBINE' : 'RUN_PENDING_COMBINE', jobId: job.id, job }, resp => {
+          if (chrome.runtime.lastError || !resp?.ok) setMsg('Saved recording action failed: ' + (resp?.error || chrome.runtime.lastError?.message || 'unknown error'), 'error');
+          loadPendingCombineFromStorage();
         });
       });
     }
-
     if (btnCombineLater) {
       btnCombineLater.addEventListener('click', () => {
         if (!pendingCombineJob) return;
+        const job = pendingCombineJob;
         hideCombinePrompt();
-        setMsg('Combined encoding postponed for 10 minutes.', 'info');
-        // Update storage directly (source of truth the popup reads on open) so
-        // the deferral sticks even if the Meet tab is unreachable.
-        const deferred = { ...pendingCombineJob, nextPromptAt: Date.now() + 10 * 60 * 1000 };
-        pendingCombineJob = deferred;
-        chrome.storage.local.set({ [PENDING_COMBINE_KEY]: deferred }, () => {
-          scheduleCombineReminder(deferred, 10 * 60 * 1000);
+        chrome.runtime.sendMessage({ type: 'DEFER_PENDING_COMBINE', jobId: job.id, job }, resp => {
+          if (chrome.runtime.lastError || !resp?.ok) setMsg('Could not postpone saved recording: ' + (resp?.error || chrome.runtime.lastError?.message || 'unknown error'), 'error');
+          else setMsg('Saved recording postponed for 10 minutes.', 'info');
+          loadPendingCombineFromStorage();
         });
-        // Best-effort: keep the content script's in-memory copy in sync.
-        chrome.runtime.sendMessage({ type: 'DEFER_PENDING_COMBINE' }, () => { void chrome.runtime.lastError; });
       });
     }
-
     if (btnCombineNever) {
       btnCombineNever.addEventListener('click', () => {
         if (!pendingCombineJob) return;
-        hideCombinePrompt();
-        clearPendingCombineTimer();
-        setMsg('Combined encoding cancelled.', 'warn');
-        // Remove storage directly so the prompt cannot reappear even if the
-        // Meet tab is closed/reloaded and the relay below never lands.
-        pendingCombineJob = null;
-        chrome.storage.local.remove(PENDING_COMBINE_KEY);
-        // Best-effort: ask the content script to also clear its raw chunks.
-        chrome.runtime.sendMessage({ type: 'CANCEL_PENDING_COMBINE' }, () => { void chrome.runtime.lastError; });
+        const job = pendingCombineJob;
+        hideCombinePrompt(); clearPendingCombineTimer();
+        // Background records a cleanup request before contacting the data owner.
+        // A closed/unreachable tab therefore retains a durable retry entry.
+        chrome.runtime.sendMessage({ type: 'CANCEL_PENDING_COMBINE', jobId: job.id, job }, resp => {
+          if (chrome.runtime.lastError || !resp?.ok) setMsg('Cleanup remains pending: ' + (resp?.error || chrome.runtime.lastError?.message || 'open a Meet tab to retry'), 'error');
+          else setMsg('Saved recording copy cleared.', 'info');
+          loadPendingCombineFromStorage();
+        });
       });
     }
 
@@ -887,6 +974,9 @@
         if (chrome.runtime.lastError) return;
 
         if (resp && resp.isRecording && resp.startTime) {
+          activeRecordingId = resp.recordingId;
+          activeRecordingContextId = resp.contextId || null;
+          activeRecordingTabId = resp.tabId ?? null;
           startTime = resp.startTime;
           isPausedState = !!resp.isPaused;
           enterRecordingUI(resp.startTime);
