@@ -129,6 +129,33 @@ The mixed output is a single audio track recorded alongside the screen video.
 
 ---
 
+## Saved recording recovery
+
+Recordings kept for later combining remain listed independently, so a later recording does not replace an earlier saved recording. When the popup offers saved recordings, select the recording you want to act on.
+
+- **Save recording** downloads the saved portion of a recovered recording. An incomplete-save warning means some data failed to persist and the recovered file may be incomplete.
+- **Do it** combines a recording whose raw files have already been saved, when the optional ffmpeg files are installed. **Later** postpones its reminder for ten minutes.
+- **Keep raw files** clears the extension's saved copy after raw downloads; **Discard recording** clears a recovered recording's saved copy. These actions do not delete files already downloaded.
+- **Retry cleanup** finishes a previous cleanup request. Open a Google Meet tab if the data owner is unavailable; failed cleanup retains its recovery entry for another attempt.
+
+START is guarded while a recording is starting or finalizing. Audio output configuration changes during recording apply to the next recording, preserving the current outputs through final save. Continue to stop before leaving a meeting; recovery cannot recreate data that never reached storage.
+
+Saving or cleaning up an older recording preserves the current recording's timer and controls. Choosing **Later** for one saved recording still allows other due recordings to prompt. Retained jobs can recover when the tab actually combining them closes or reloads.
+
+If the selected meeting tab closes, its timer and recording controls return to idle while another tab's active recording remains intact. Refresh can select that remaining meeting tab.
+
+## Verification
+
+Run the lifecycle regression suite with Node 18 or later; no dependency installation or build step is needed:
+
+```sh
+node --test tests/page-lifecycle.test.cjs tests/extension-lifecycle.test.cjs
+```
+
+The tests execute the extension source with simulated browser APIs. The optional real ffmpeg.wasm cleanup test runs when `vendor/ffmpeg/ffmpeg-core.js` and `ffmpeg-core.wasm` are installed and otherwise skips. The [memory/resource lifecycle report](docs/memory-leak-fixes.md) explains the leak findings, fixes, and verification limits. Real Chrome/Meet recording, playback, and native memory measurements require browser validation.
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
