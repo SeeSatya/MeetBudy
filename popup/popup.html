@@ -207,16 +207,6 @@
       color: var(--accent);
     }
     .menu-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
-    .recording-permission {
-      display: flex;
-      align-items: flex-start;
-      gap: 8px;
-      font-size: 11px;
-      line-height: 1.5;
-      color: var(--text-muted);
-      cursor: pointer;
-    }
-    .recording-permission input { margin-top: 3px; accent-color: var(--accent); }
     #panelDisclaimer { z-index: 1001; }
     .disclaimer-copy { font-size: 12px; line-height: 1.6; color: var(--text-muted); }
     .disclaimer-copy p + p { margin-top: 12px; }
@@ -691,22 +681,20 @@
       </div>
       <div class="menu-right">
         <button id="linkSettings" type="button" class="menu-link">Settings</button>
-        <button id="linkDisclaimer" type="button" class="menu-link" aria-haspopup="dialog" aria-controls="panelDisclaimer">Disclaimer</button>
         <button id="linkLogs" type="button" class="menu-link">Logs</button>
       </div>
     </div>
-    <label class="recording-permission"><input id="consentAcknowledged" type="checkbox"> I have permission from the host and participants to record this meeting.</label>
   </div>
 
-  <!-- ── Disclaimer Modal ────────────────────────────────────── -->
+  <!-- ── First-use Notice ─────────────────────────────────────── -->
   <div id="panelDisclaimer" class="modal-overlay">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="disclaimerTitle" aria-describedby="disclaimerText">
       <div class="modal-header">
-        <div id="disclaimerTitle" class="modal-title">Disclaimer</div>
+        <div id="disclaimerTitle" class="modal-title">Before you record</div>
       </div>
       <div class="modal-body disclaimer-copy">
         <div id="disclaimerText">
-          <p><strong>Get permission before recording.</strong> Record a meeting only with explicit permission from the host and participants. Respect their privacy and follow the recording laws that apply to you.</p>
+          <p><strong>Get permission before recording.</strong> Do not use this extension to record a meeting without explicit permission from the host and participants. Respect their privacy and follow the recording laws that apply to you.</p>
           <p><strong>Personal use only.</strong> Do not sell this extension or its recordings, use them commercially, or use them for spam.</p>
           <p>You are responsible for how you record, use, and share meeting content.</p>
         </div>

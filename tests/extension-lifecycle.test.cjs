@@ -427,7 +427,6 @@ test('Other-tab status and chunk broadcasts cannot reset the selected recording 
 
 test('Started recording restores the enabled Stop control after async START', async () => {
   const e = environment(); await e.page('INJECTED'); const ui = await popup(e);
-  e.document.get('consentAcknowledged').checked=true;
   await e.document.get('btnRecord').click(); await drain();
   assert.equal(e.document.get('btnRecord').attrs.disabled, 'true');
   const start = e.posts.find(post => post.cmd === 'START'); assert(start);

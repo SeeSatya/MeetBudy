@@ -65,7 +65,7 @@ It has some issues, which i have fixed in the updated versions but not in this v
 2. Wait for a participant to start presenting (screen share)
 3. Click the Meet Recorder icon in the toolbar
 4. The popup will show "Screen share detected!" when ready
-5. Confirm permission from the meeting host and participants in the popup
+5. On first use, read the recording-permission notice and click OK
 6. Click [ ⏺ Start Recording ]
 7. When done → click [ ⏹ Stop & Download ]
 8. The recording downloads with its correct .webm or .mkv extension

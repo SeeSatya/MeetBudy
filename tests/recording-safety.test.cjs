@@ -33,21 +33,21 @@ test('Toolbar restores its icon after navigation completes without a URL change 
   assert(group.actionCalls.some(x=>x.type==='icon'&&x.tabId===e.id));
 });
 
-test('START always checks consent and active site even when another tab is recording',async()=>{
+test('START checks the active site even when another tab is recording',async()=>{
   const group=cluster(),meet=environment({group,id:7}),offsite=environment({group,id:8});await meet.page('RECORDING_STARTED',{recordingId:'active'});
   group.updateTab(8,'https://example.com/');group.activateTab(8);
   const before=meet.posts.length;
-  assert.equal((await group.dispatch({type:'START_RECORDING'})).ok,false);
-  assert.match((await group.dispatch({type:'START_RECORDING',consentAcknowledged:true})).error,/active Google Meet/);
+  const response=await group.dispatch({type:'START_RECORDING'});
+  assert.equal(response.ok,false);
+  assert.match(response.error,/active Google Meet/);
   assert.equal(meet.posts.length,before);assert.equal(offsite.posts.filter(x=>x.cmd==='START').length,0);
   await group.dispatch({type:'STOP_RECORDING',targetTabId:7,recordingId:'active'});assert(meet.posts.some(x=>x.cmd==='STOP') || meet.window.__content.state().pendingCount>0);
 });
 
-test('Popup requires acknowledgment for each accepted recording and keeps Stop usable',async()=>{
+test('Popup starts without a permission checkbox and keeps Stop usable',async()=>{
   const e=environment();await e.page('INJECTED');const ui=await popup(e);
-  await e.document.get('btnRecord').click();await drain();assert.equal(e.posts.filter(x=>x.cmd==='START').length,0);assert.match(e.document.get('statusMsg').textContent,/permission/);
-  e.document.get('consentAcknowledged').checked=true;await e.document.get('btnRecord').click();await drain();
-  const start=e.posts.find(x=>x.cmd==='START');assert(start);assert.equal(e.document.get('consentAcknowledged').checked,false);
+  await e.document.get('btnRecord').click();await drain();
+  const start=e.posts.find(x=>x.cmd==='START');assert(start);
   await e.page('RECORDING_STARTED',{recordingId:start.recordingId,mimeType:'video/webm'});ui.message(e.group.backgroundMessages.find(x=>x.type==='STATUS'&&x.payload.state==='recording'));
   await e.document.get('btnRecord').click();assert(e.posts.some(x=>x.cmd==='STOP'));
 });

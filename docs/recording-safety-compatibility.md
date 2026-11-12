@@ -4,7 +4,7 @@ This change addresses five problems: missing consent guidance, an always-colored
 
 ## Causes
 
-- The popup did not show the README's recording-consent guidance or require an acknowledgement before Start.
+- The popup did not show the README's recording-consent guidance. A first-use notice now explains permission and personal-use requirements; OK is remembered locally.
 - The extension action used the same colored icon on every website. Starting from an unsupported active site could silently target another open Meet tab.
 - The old duration fixer rewrote only the first stored chunk. It converted an unknown-size Segment into a finite Segment covering that chunk, then concatenated the remaining chunks outside the declared container. It also described a seek index without generating Cues, changed TimecodeScale, skipped secondary audio metadata, and used the time of recovery to estimate duration.
 - Capture and finalization belong to the Meet document. There was no unload warning for active work, and destroying that document also destroys its native recorder callbacks.
@@ -22,7 +22,7 @@ The meeting-loss timeout measures availability of incoming meeting media, rather
 
 ## Automated validation
 
-`node --test tests/*.test.cjs` passes 122 tests with no skips when the bundled ffmpeg files are present. Source-executing regressions cover consent and active-site routing, per-tab icons, countdown/restoration/paused capture, close cancellation and teardown, recorder/storage deadlines, restart recovery, ownership during active saves, delayed database reopen after recovery, and metadata sizes/timestamps/cue addresses/fallback/cancellation. Syntax, manifest resource paths and inactive-icon dimensions/grayscale also pass checks.
+`node --test tests/*.test.cjs` passes 123 tests with no skips when the bundled ffmpeg files are present. Source-executing regressions cover Start without a permission checkbox and active-site routing, per-tab icons, countdown/restoration/paused capture, close cancellation and teardown, recorder/storage deadlines, restart recovery, ownership during active saves, delayed database reopen after recovery, and metadata sizes/timestamps/cue addresses/fallback/cancellation. Syntax, manifest resource paths and inactive-icon dimensions/grayscale also pass checks.
 
 Generated samples with actual ffmpeg.wasm verify VP8/VP9 with Opus, H.264/Matroska with Opus, and audio-only Opus. Repaired output decodes, preserves encoded packet hashes, and supports seeking into multiple-cluster samples with matching packet hashes. These samples verify codec/container behavior, not native Meet recording or Windows player support.
 
@@ -30,7 +30,7 @@ Generated samples with actual ffmpeg.wasm verify VP8/VP9 with Opus, H.264/Matros
 
 1. Reload the unpacked extension and hard-refresh Meet tabs so the new page and content scripts are installed.
 2. On a non-Meet page, verify the gray toolbar icon and unavailable-site explanation. Navigate to Meet and back, including a lookalike host, and check that availability follows the current tab.
-3. Verify that Start requires the permission acknowledgement for each recording, while Stop and saved-recording recovery remain usable.
+3. On a fresh installation, verify that the permission notice appears before using the controls. Click OK and reopen the popup: the notice should stay hidden, with only Settings and Logs in the menu and no permission checkbox. Verify that Start, Stop and saved-recording recovery remain usable.
 4. Record with one and multiple audio outputs. Stop normally, then open the saved files and seek near the end in Chrome, VLC and Windows players with the relevant codecs installed.
 5. Leave a call through Meet's UI while retaining the tab. Check the 10-second countdown and automatic final save. End only a presentation while other participants remain; the recording should continue. Repeat with silent participants and a static screen.
 6. Disconnect and reconnect during the countdown. Incoming media recovery should cancel it. Repeat while recording is paused.

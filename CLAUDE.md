@@ -64,7 +64,7 @@ Meet's DOM changes often and **virtualizes participant tiles**: in an 80+ person
 
 ## Recording safety and availability
 
-The popup requires a fresh host/participant permission acknowledgement for Start and displays the personal-use restriction. Background allows Start only on the active HTTPS Google Meet tab. Stop and saved-job actions retain explicit recording ownership. Toolbar availability is per tab, with grayscale defaults for unsupported sites.
+The popup shows a recording-permission and personal-use notice on first use, then remembers OK in local storage. There is no per-recording permission checkbox or Disclaimer menu button. Background allows Start only on the active HTTPS Google Meet tab. Stop and saved-job actions retain explicit recording ownership. Toolbar availability is per tab, with grayscale defaults for unsupported sites.
 
 Incoming meeting-media availability drives a 10-second Stop countdown, including while paused. Generated compositor/mixer tracks, local microphone/preview tracks and extension sinks cannot keep the meeting alive. Silent audio and static presentations remain available media. Preserve receiver/source ownership across temporary ICE failures so a reconnect can cancel the countdown.
 

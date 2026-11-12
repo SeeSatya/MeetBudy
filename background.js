@@ -344,10 +344,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
     if (message.type === 'START_RECORDING') {
-      if (message.consentAcknowledged !== true) {
-        respondOnce({ ok: false, error: 'Confirm host and participant permission before recording' });
-        return true;
-      }
       chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
         const tab = tabs?.[0];
         if (!tab || !isMeetUrl(tab.url)) respondOnce({ ok: false, error: 'Recording is available only on the active Google Meet website' });

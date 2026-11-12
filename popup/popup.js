@@ -6,7 +6,6 @@
   'use strict';
 
   // ─── DOM refs ────────────────────────────────────────────────────────────
-  const consentAcknowledged = document.getElementById('consentAcknowledged');
   const btnRecord          = document.getElementById('btnRecord');
   const btnPause           = document.getElementById('btnPause');
   const svgPause           = document.getElementById('svgPause');
@@ -24,7 +23,6 @@
   const statVips           = document.getElementById('statVips');
   
   const linkSettings       = document.getElementById('linkSettings');
-  const linkDisclaimer     = document.getElementById('linkDisclaimer');
   const linkLogs           = document.getElementById('linkLogs');
   const panelSettings      = document.getElementById('panelSettings');
   const panelDisclaimer    = document.getElementById('panelDisclaimer');
@@ -817,13 +815,7 @@
         setMsg('Starting recording…', 'info');
         syncTracksWithTab(); // send final tracks config
         syncVipsWithTab(); // send final VIPs list
-        if (!consentAcknowledged?.checked) {
-          btnRecord.removeAttribute('disabled');
-          setMsg('Confirm meeting host and participant permission before recording.', 'error');
-          return;
-        }
-        chrome.runtime.sendMessage({ type: 'START_RECORDING', consentAcknowledged: true }, (resp) => {
-          if (resp?.ok) consentAcknowledged.checked = false;
+        chrome.runtime.sendMessage({ type: 'START_RECORDING' }, (resp) => {
           if (chrome.runtime.lastError || !resp?.ok) {
             btnRecord.removeAttribute('disabled');
             setMsg('❌ Could not start recording: ' + (resp?.error || 'make sure Google Meet is open'), 'error');
@@ -918,9 +910,8 @@
       });
     }
 
-    // Settings, Disclaimer & Logs open as themed modals
+    // Settings & Logs open as themed modals; the notice appears only on first use.
     linkSettings.addEventListener('click', () => panelSettings.classList.add('visible'));
-    linkDisclaimer.addEventListener('click', showDisclaimer);
     linkLogs.addEventListener('click', () => panelLogs.classList.add('visible'));
     btnDisclaimerOk.addEventListener('click', () => {
       btnDisclaimerOk.disabled = true;
@@ -933,7 +924,7 @@
         }
         panelDisclaimer.classList.remove('visible');
         if (modalCombine?.classList.contains('visible')) btnCombineNow.focus?.();
-        else linkDisclaimer.focus?.();
+        else btnRecord.focus?.();
       });
     });
     // Keep keyboard navigation inside this one-button dialog.
