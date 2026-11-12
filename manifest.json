@@ -18,8 +18,14 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://meet.google.com/*"],
-      "js": ["muxer.js", "content_script.js"],
+      "matches": [
+        "https://meet.google.com/*"
+      ],
+      "js": [
+        "webm_metadata.js",
+        "muxer.js",
+        "content_script.js"
+      ],
       "run_at": "document_start"
     }
   ],
@@ -27,9 +33,9 @@
     "default_popup": "popup/popup.html",
     "default_title": "Meet Recorder",
     "default_icon": {
-      "16": "icons/icon16.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
+      "16": "icons/icon16-inactive.png",
+      "48": "icons/icon48-inactive.png",
+      "128": "icons/icon128-inactive.png"
     }
   },
   "icons": {
@@ -46,7 +52,9 @@
         "vendor/ffmpeg/ffmpeg-core.js",
         "vendor/ffmpeg/ffmpeg-core.wasm"
       ],
-      "matches": ["https://meet.google.com/*"]
+      "matches": [
+        "https://meet.google.com/*"
+      ]
     }
   ],
   "content_security_policy": {

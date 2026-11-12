@@ -24,10 +24,10 @@ class Events {
   dispatch(type, event = {}) { for (const fn of [...(this.listeners.get(type) || [])]) fn(event); }
 }
 function setup(opts = {}) {
-  let id = 0;
+  let id = 0, now=1000000;
   const timers = new Map(), recorderInventory = [], workerInventory = [], urls = new Set(), elements = [], nodes = [], messages = [], writes = [], pendingWrites = [], stopEvents = [];
   class Track extends Events {
-    constructor(kind, label = '') { super(); this.id = 'track-' + (++id); this.kind = kind; this.label = label; this.contentHint = ''; this.readyState = 'live'; this.enabled = true; }
+    constructor(kind, label = '') { super(); this.id = 'track-' + (++id); this.kind = kind; this.label = label; this.contentHint = ''; this.readyState = 'live'; this.enabled = true; this.muted = false; }
     getSettings() { return {}; }
     stop() { this.readyState = 'ended'; }
     endNaturally() { this.readyState = 'ended'; this.dispatch('ended'); }
@@ -100,7 +100,7 @@ function setup(opts = {}) {
   };
   const context = vm.createContext({window, document, AudioContext: AudioCtx, MediaStream: Stream, MediaRecorder: Recorder, Worker,
     Image: class { constructor() { this.complete = false; this.naturalWidth = 0; } },
-    Blob, Uint8Array, Map, Set, Date, Reflect, Object, Promise,
+    Blob, Uint8Array, Map, Set, Date: class extends Date {static now() {return now;}}, Reflect, Object, Promise,
     console: {log() {}, warn() {}, error() {}},
     URL: {createObjectURL() { const url = 'blob:fixture-' + (++id); urls.add(url); return url; }, revokeObjectURL(url) { urls.delete(url); }},
     indexedDB: {open() { const req = {}; queueMicrotask(() => req.onsuccess?.({target: {result: {close() {}, transaction() {const tx = {objectStore: () => ({add(row) {writes.push(row); return {};}})}; const complete = () => opts.failWrite ? tx.onabort?.() : tx.oncomplete?.(); if (opts.deferredWrites) pendingWrites.push(complete); else queueMicrotask(complete); return tx;}}}})); return req;}},
@@ -113,6 +113,7 @@ function setup(opts = {}) {
     async settle() { for(let n=0;n<30;n++) await Promise.resolve(); },
     releaseWrites() { pendingWrites.splice(0).forEach(fn=>fn()); },
     releaseStops() { stopEvents.splice(0).forEach(fn=>fn()); },
+    advanceTime(ms) {now+=ms;},
     fire(ms) { const matches = [...timers].filter(([,v]) => v.ms === ms); for (const [tid, v] of matches) { if (!v.interval) timers.delete(tid); v.fn(); } }
   };
 }

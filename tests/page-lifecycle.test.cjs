@@ -322,3 +322,63 @@ test('Persistent accepted-start routing failure rolls back idle instead of annou
   for(const gate of e.a.trackGains.values()) assert.equal(gate.gain.value,0);
   gain.connect=originalConnect;await start(e,'repaired');assertRemoteOutputRoute(e,remote,source,sink,3);await stopped(e);pc.close();noTracks(e);
 });
+
+test('No incoming media stops after ten seconds despite generated tracks and pause', async () => {
+  const e=setup({finalChunkSize:20});await start(e);e.command('PAUSE');
+  const canvas=e.a.state().recordingCanvasStream.getVideoTracks()[0];assert.equal(canvas.readyState,'live');
+  for(let i=0;i<9;i++) {e.advanceTime(1000);e.fire(1000);await e.settle();assert.equal(e.messages.filter(m=>m.event==='RECORDING_STOPPED').length,0);}
+  e.advanceTime(1000);e.fire(1000);await e.settle();
+  assert.equal(e.messages.filter(m=>m.event==='RECORDING_STOPPED').length,1);assert.equal(canvas.readyState,'ended');
+  assert.equal(e.messages.findLast(m=>m.event==='MEETING_ACTIVITY').data.seconds,0);
+  assert.equal(e.writes.length,1);
+});
+
+test('Silent incoming audio/static video remain valid and recovery cancels media-loss countdown', async () => {
+  const e=setup(),pc=new e.window.RTCPeerConnection(),remote=new e.Track('audio');pc.receive(remote);await start(e);
+  for(let i=0;i<12;i++) {e.advanceTime(1000);e.fire(1000);await e.settle();}
+  assert.equal(e.a.state().isRecording,true);assert.equal(e.messages.filter(m=>m.event==='MEETING_ACTIVITY').length,0);
+  remote.muted=true;e.advanceTime(1000);e.fire(1000);assert.equal(e.messages.findLast(m=>m.event==='MEETING_ACTIVITY').data.seconds,10);
+  for(let i=0;i<5;i++) {e.advanceTime(1000);e.fire(1000);}
+  remote.muted=false;e.advanceTime(1000);e.fire(1000);assert.equal(e.messages.findLast(m=>m.event==='MEETING_ACTIVITY').data.state,'activity_restored');
+  const staticVideo=new e.Track('video');pc.receive(staticVideo);remote.endNaturally();
+  for(let i=0;i<12;i++) {e.advanceTime(1000);e.fire(1000);await e.settle();}assert.equal(e.a.state().isRecording,true);await stopped(e);
+});
+
+test('Recoverable disconnected peer starts grace period while retaining exact remote sources', async () => {
+  const e=setup(),pc=new e.window.RTCPeerConnection(),remote=new e.Track('audio');pc.receive(remote);const source=e.a.audioSources.get(remote.id);await start(e);
+  pc.connectionState='disconnected';pc.dispatch('connectionstatechange');e.advanceTime(1000);e.fire(1000);
+  assert.equal(e.messages.findLast(m=>m.event==='MEETING_ACTIVITY').data.seconds,10);assert.equal(e.a.audioSources.get(remote.id),source);
+  pc.connectionState='connected';e.advanceTime(1000);e.fire(1000);assert.equal(e.messages.findLast(m=>m.event==='MEETING_ACTIVITY').data.state,'activity_restored');await stopped(e);
+});
+
+test('Cancelling leave confirmation preserves recording; actual pagehide requests final flush', async () => {
+  const e=setup({deferredResume:true,finalChunkSize:12});e.command('START',{recordingId:'closing'});
+  let prevented=0;const warning={preventDefault(){prevented++;},returnValue:null};e.window.dispatch('beforeunload',warning);assert.equal(prevented,1);assert.equal(warning.returnValue,'');
+  e.resumePending.splice(0).forEach(fn=>fn());await e.settle();const recorder=e.a.state().mediaRecorder;
+  e.window.dispatch('beforeunload',warning);assert.equal(recorder.state,'recording');
+  e.window.dispatch('pagehide',{persisted:false});await e.settle();assert.equal(e.messages.filter(m=>m.event==='RECORDING_STOPPED').length,1);assert.equal(e.writes.length,1);
+  e.window.dispatch('beforeunload',warning);assert.equal(prevented,2);
+});
+
+test('Missing native stop callbacks finalize boundedly and mark committed output incomplete', async () => {
+  const e=setup({deferredStop:true});configure(e);await start(e);e.recorderInventory.forEach(r=>r.data(24));await e.settle();const stopping=e.a.stopRecording();await e.settle();
+  assert(e.a.state().activeSession);e.fire(5000);await stopping;await e.settle();
+  const event=e.messages.find(m=>m.event==='RECORDING_STOPPED');assert.equal(event.data.incomplete,true);assert.equal(event.data.totalChunks,1);assert.equal(event.data.secondaries[0].chunks,1);assert.equal(e.a.state().activeSession,null);
+  await start(e,'new');e.releaseStops();await e.settle();assert.equal(e.a.state().mediaRecorder.state,'recording');
+  const end=e.a.stopRecording();e.releaseStops();await end;
+});
+
+test('Stalled IDB drain releases busy state without deleting data or leaking old chunk progress', async () => {
+  const e=setup({deferredWrites:true});await start(e,'stalled');e.a.state().mediaRecorder.data(24);await e.settle();const stopping=e.a.stopRecording();await e.settle();e.fire(10000);await stopping;
+  const event=e.messages.find(m=>m.event==='RECORDING_STOPPED');assert.equal(event.data.incomplete,true);await start(e,'new');const before=e.messages.filter(m=>m.event==='CHUNK_SAVED').length;
+  e.releaseWrites();await e.settle();assert.equal(e.messages.filter(m=>m.event==='CHUNK_SAVED').length,before);assert.equal(e.a.state().mediaRecorder.state,'recording');await stopped(e);
+});
+
+test('Local senders and a self-preview do not count as incoming meeting media', async () => {
+  const e=setup(),pc=new e.window.RTCPeerConnection(),local=new e.Track('video');pc.senders=[{track:local}];pc.receive(local);
+  const preview=e.context.document.createElement('video');preview.srcObject={getTracks:()=>[local]};preview.closest=()=>({textContent:"You're continuously framed",querySelector:()=>null});e.context.document.body.appendChild(preview);
+  await start(e);
+  for(let i=0;i<10;i++){e.advanceTime(1000);e.fire(1000);await e.settle();}assert.equal(e.messages.filter(m=>m.event==='RECORDING_STOPPED').length,1);
+  const dom=setup(),video=new dom.Track('video'),self=dom.context.document.createElement('video');self.srcObject={getTracks:()=>[video]};self.closest=()=>({textContent:'Backgrounds and visual effects',querySelector:()=>null});dom.context.document.body.appendChild(self);dom.a.addVideoTrack(video);
+  await start(dom);for(let i=0;i<10;i++){dom.advanceTime(1000);dom.fire(1000);await dom.settle();}assert.equal(dom.messages.filter(m=>m.event==='RECORDING_STOPPED').length,1);
+});

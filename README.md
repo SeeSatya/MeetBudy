@@ -27,13 +27,13 @@ It has some issues, which i have fixed in the updated versions but not in this v
 > Pausing issue
 - Pausing doesn't work, don't try it
 
-> SAVE issue
-- CLICK STOP BUTTON BEFORE THE MEETING ENDS, ELSE YOU WILL LOSE THE RECORIDNG
-- Same for reload, stop the recording before reload
+> Recording safety
+- Stop before leaving when possible. After 10 seconds without incoming meeting media, the recorder stops automatically and saves the available output.
+- Chrome may show a leave-page warning during recording or saving. Forced closure can bypass it; reopen Meet to recover chunks already committed to storage.
 
-> Dual Video
-- This is just for safe guard, 2 different video files will be saved one with `.webm` and other with `.mkv`
-- The mkv is the watchable video where as the Webm may not be playable.
+> Playback
+- Raw downloads receive duration and seek metadata without reencoding. VP8/VP9/AV1 recordings use `.webm`; codecs that require Matroska use `.mkv`.
+- Player support still depends on the encoded codecs. Metadata repair cannot install missing Windows decoders.
 
 > Ignore Stream
 - Doesn't work
@@ -65,9 +65,10 @@ It has some issues, which i have fixed in the updated versions but not in this v
 2. Wait for a participant to start presenting (screen share)
 3. Click the Meet Recorder icon in the toolbar
 4. The popup will show "Screen share detected!" when ready
-5. Click [ ⏺ Start Recording ]
-6. When done → click [ ⏹ Stop & Download ]
-7. A .webm file downloads automatically to your Downloads folder
+5. Confirm permission from the meeting host and participants in the popup
+6. Click [ ⏺ Start Recording ]
+7. When done → click [ ⏹ Stop & Download ]
+8. The recording downloads with its correct .webm or .mkv extension
 ```
 
 ### What gets recorded
@@ -101,8 +102,10 @@ MeetRecorder/
 
 ## Technical Notes
 
-### Why `.webm` format?
-`MediaRecorder` on Chrome natively outputs VP8/VP9 + Opus audio as `.webm`. This plays in:
+### Recording format and metadata
+Every raw output, including additional audio tracks, is finalized with a complete container size, media-timestamp duration, a seek header and keyframe cues. Encoded audio and video remain unchanged. The finalizer reads small headers and retains media as Blob slices, avoiding a second full copy of a long recording.
+
+VP8/VP9/AV1 with WebM-compatible audio use `.webm`. H.264 or other non-WebM codecs use `.mkv` with the Matroska document type. If metadata repair fails, the raw output remains available with a warning. Playback depends on the codecs supported by your player. Typical WebM players include:
 - Chrome, Firefox, Edge browsers
 - VLC media player
 - Most modern video editors (DaVinci Resolve, etc.)
@@ -110,7 +113,8 @@ MeetRecorder/
 ### Resilience to network drops
 Chunks are saved to **IndexedDB** every 2 seconds. If your internet drops:
 - The WebRTC connection may briefly drop, but the recorder keeps any data already buffered
-- When Meet reconnects, new tracks are automatically detected and recording resumes
+- Incoming media restored within the 10-second inactivity countdown cancels automatic Stop
+- Silent audio and a static presentation still count as available media; ending only a screen share does not stop recording while other incoming media remains
 - You won't lose data that was already saved to IndexedDB
 
 ### Screen share detection
@@ -138,7 +142,7 @@ Recordings kept for later combining remain listed independently, so a later reco
 - **Keep raw files** clears the extension's saved copy after raw downloads; **Discard recording** clears a recovered recording's saved copy. These actions do not delete files already downloaded.
 - **Retry cleanup** finishes a previous cleanup request. Open a Google Meet tab if the data owner is unavailable; failed cleanup retains its recovery entry for another attempt.
 
-START is guarded while a recording is starting or finalizing. Audio output configuration changes during recording apply to the next recording, preserving the current outputs through final save. Continue to stop before leaving a meeting; recovery cannot recreate data that never reached storage.
+START is guarded while a recording is starting or finalizing. Audio output configuration changes during recording apply to the next recording, preserving the current outputs through final save. Stop before leaving when possible. Chrome controls whether to show the generic leave-page confirmation and typically requires prior interaction with the Meet page. Cancelling that confirmation leaves recording running. Accepting closure, a crash or forced shutdown may lose the latest uncommitted media; recovery cannot recreate data that never reached storage.
 
 Saving or cleaning up an older recording preserves the current recording's timer and controls. Choosing **Later** for one saved recording still allows other due recordings to prompt. Retained jobs can recover when the tab actually combining them closes or reloads.
 
@@ -149,10 +153,10 @@ If the selected meeting tab closes, its timer and recording controls return to i
 Run the lifecycle regression suite with Node 18 or later; no dependency installation or build step is needed:
 
 ```sh
-node --test tests/page-lifecycle.test.cjs tests/extension-lifecycle.test.cjs
+node --test tests/*.test.cjs
 ```
 
-The tests execute the extension source with simulated browser APIs. The optional real ffmpeg.wasm cleanup test runs when `vendor/ffmpeg/ffmpeg-core.js` and `ffmpeg-core.wasm` are installed and otherwise skips. The [memory/resource lifecycle report](docs/memory-leak-fixes.md) explains the leak findings, fixes, and verification limits. Real Chrome/Meet recording, playback, and native memory measurements require browser validation.
+The tests execute the extension source with simulated browser APIs. The optional real ffmpeg.wasm cleanup test runs when `vendor/ffmpeg/ffmpeg-core.js` and `ffmpeg-core.wasm` are installed and otherwise skips. The [memory/resource lifecycle report](docs/memory-leak-fixes.md) explains the leak findings, fixes, and verification limits. The [recording safety and compatibility report](docs/recording-safety-compatibility.md) documents the new behavior and native validation checklist. Real Chrome/Meet recording, browser quit dialogs, Windows playback and native memory measurements require manual validation.
 
 ---
 
@@ -164,7 +168,8 @@ The tests execute the extension source with simulated browser APIs. The optional
 | Screen share not detected | Click 🔄 Refresh — the presenter may have shared before the extension loaded |
 | No audio in recording | Confirm participants have unmuted themselves in Meet |
 | `.webm` won't play on Windows | Install [VLC](https://www.videolan.org/) or use Chrome to open the file |
-| Recording stopped mid-way | Screen share was ended by the presenter — re-record when they share again |
+| Recording stopped automatically | Incoming meeting media was unavailable for 10 seconds; check the popup Logs and saved output |
+| Gray toolbar icon | Open the active tab on `https://meet.google.com`; recording cannot start from another website |
 
 ---
 
@@ -172,4 +177,4 @@ The tests execute the extension source with simulated browser APIs. The optional
 
 > ⚠️ **Only record meetings where you have explicit consent from all participants.**  
 > Recording without consent may violate privacy laws (GDPR, ECPA, etc.) in your jurisdiction.  
-> This tool is intended for legitimate team use (e.g., your own team's meeting records).
+> Personal use only: do not sell recordings, use them commercially, or spam. Obtain explicit permission from the meeting host and participants before each recording.

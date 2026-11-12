@@ -6,6 +6,7 @@
   'use strict';
 
   // ─── DOM refs ────────────────────────────────────────────────────────────
+  const consentAcknowledged = document.getElementById('consentAcknowledged');
   const btnRecord          = document.getElementById('btnRecord');
   const btnPause           = document.getElementById('btnPause');
   const svgPause           = document.getElementById('svgPause');
@@ -72,6 +73,7 @@
   const X_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
 
   // ─── State ───────────────────────────────────────────────────────────────
+  let siteAvailable = true;
   let isRecording     = false;
   let activeRecordingId = null;
   let activeRecordingContextId = null;
@@ -176,7 +178,7 @@
     if (combinePromptText) combinePromptText.textContent = cleanup
       ? 'Recording cleanup is pending. Retry to finish removing its saved copy.'
       : busy ? 'This recording is being combined. You can cancel it and keep the raw files.'
-      : recovery ? (pendingCombineJob.writeFailed
+      : recovery ? ((pendingCombineJob.writeFailed || pendingCombineJob.incomplete)
         ? 'Some recording data failed to save. Recover the saved portion or discard it; the file may be incomplete.'
         : 'A saved recording can be recovered. Save it now or discard its saved data.')
       : (text || 'Combined encoding is ready. Do you want to run it now?');
@@ -688,8 +690,17 @@
     }
 
     switch (state) {
+      case 'activity_countdown':
+      case 'activity_restored':
+        setMsg(message, 'info');
+        break;
+
+      case 'metadata_warning':
+        setMsg(message, 'error');
+        break;
+
       case 'ready':
-        setMsg('Ready to record.', 'info');
+        if (!isRecording) setMsg(siteAvailable ? 'Ready to record.' : 'Recording is available only on Google Meet. Open meet.google.com to start.', 'info');
         break;
 
       case 'screen_detected':
@@ -786,11 +797,18 @@
         });
       } else {
         // Start recording
+        if (!siteAvailable) { setMsg('Recording is available only on the active Google Meet website.', 'error'); return; }
         btnRecord.setAttribute('disabled', 'true');
         setMsg('Starting recording…', 'info');
         syncTracksWithTab(); // send final tracks config
         syncVipsWithTab(); // send final VIPs list
-        chrome.runtime.sendMessage({ type: 'START_RECORDING' }, (resp) => {
+        if (!consentAcknowledged?.checked) {
+          btnRecord.removeAttribute('disabled');
+          setMsg('Confirm meeting host and participant permission before recording.', 'error');
+          return;
+        }
+        chrome.runtime.sendMessage({ type: 'START_RECORDING', consentAcknowledged: true }, (resp) => {
+          if (resp?.ok) consentAcknowledged.checked = false;
           if (chrome.runtime.lastError || !resp?.ok) {
             btnRecord.removeAttribute('disabled');
             setMsg('❌ Could not start recording: ' + (resp?.error || 'make sure Google Meet is open'), 'error');
@@ -969,6 +987,11 @@
       initButtonListeners();
       loadPendingCombineFromStorage();
       
+      chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+        try { const url = new URL(tabs?.[0]?.url); siteAvailable = url.protocol === 'https:' && url.hostname === 'meet.google.com' && !url.port; }
+        catch (_) { siteAvailable = false; }
+        if (!siteAvailable && !isRecording) setMsg('Recording is available only on Google Meet. Open meet.google.com to start.', 'info');
+      });
       // Get initial status from tab and sync local lists
       chrome.runtime.sendMessage({ type: 'GET_RECORDING_STATE' }, (resp) => {
         if (chrome.runtime.lastError) return;
