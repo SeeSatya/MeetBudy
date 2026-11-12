@@ -1,1 +1,54 @@
-.claude
+# Local agent and editor state
+.claude/
+.codex/
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+
+# Local environment files and extension signing keys
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+
+# Operating system files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Dependencies, caches, and test output
+node_modules/
+.cache/
+.nyc_output/
+coverage/
+test-results/
+playwright-report/
+blob-report/
+
+# Logs, temporary files, and editor backups
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+/tmp/
+/temp/
+
+# Generated extension packages
+/build/
+/dist/
+/releases/
+/*.zip
+*.crx
+
+# Locally downloaded recordings (keep source and documentation assets visible)
+/recordings/
+meet-recording-*.webm
+meet-recording-*.mkv
