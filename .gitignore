@@ -48,6 +48,9 @@ blob-report/
 /*.zip
 *.crx
 
+# Local generated documentation
+/documentation.md
+
 # Locally downloaded recordings (keep source and documentation assets visible)
 /recordings/
 meet-recording-*.webm
