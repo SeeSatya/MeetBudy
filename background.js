@@ -14,8 +14,10 @@ let recordingState = {
 
 // ── Tab state cache: tabId → latest status payload ───────────────────────────
 const tabState = new Map();
+let recordingStateRevision = 0;
 function retireRecordingState(message = 'Recording context closed') {
   const retired = recordingState;
+  recordingStateRevision++;
   recordingState = { isRecording: false, isPaused: false, startTime: null, recordingId: null, tabId: null, contextId: null };
   chrome.storage.local.set({ meetRecorderState: recordingState });
   chrome.runtime.sendMessage({ type: 'STATUS', payload: { scope: 'recording', state: 'stopped',
@@ -63,7 +65,8 @@ async function listJobs() {
   // is retained conservatively instead of having its claim stolen.
   const result = [];
   for (const job of jobs) result.push(job.state === 'combining'
-    ? await recoverExecution(job.id, job.executionToken) : job);
+    ? await recoverExecution(job.id, job.executionToken)
+    : ['recording', 'preparing'].includes(job.state) ? await recoverRecordingJob(job.id) : job);
   return result.filter(Boolean);
 }
 function executionState(tabId) {
@@ -76,6 +79,17 @@ function executionState(tabId) {
         finish(chrome.runtime.lastError ? null : response);
       });
     } catch (_) { finish(null); }
+  });
+}
+function recoverRecordingJob(id) {
+  return serializeJob(id, async () => {
+    const current = await getJob(id);
+    if (!current || !['recording', 'preparing'].includes(current.state)) return current;
+    const response = await executionState(current.ownerTabId);
+    if (response?.unknown || response?.recordingId === current.recordingId || response?.savingRecordingIds?.includes(current.recordingId)) return current;
+    const job = { ...current, state: 'recovery', needsRawSave: true, incomplete: true, revision: current.revision + 1 };
+    await storageCall('set', { [jobKey(id)]: job });
+    return job;
   });
 }
 function recoverExecution(id, token, closedTabId) {
@@ -195,6 +209,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: true });
       return true;
     }
+    recordingStateRevision++;
     recordingState = {
       ...recordingState,
       ...message.state,
@@ -213,9 +228,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (recordingState.isRecording) {
       sendResponse(recordingState);
     } else {
-      chrome.storage.local.get('meetRecorderState', (data) => {
-        sendResponse(data.meetRecorderState || { isRecording: false });
-      });
+      const revision = recordingStateRevision;
+      storageCall('get', 'meetRecorderState').then(async data => {
+        const stored = data.meetRecorderState || { isRecording: false };
+        const live = stored.isRecording ? await executionState(stored.tabId) : null;
+        if (revision !== recordingStateRevision) { sendResponse(recordingState); return; }
+        if (stored.isRecording && !live?.unknown && live?.recordingId !== stored.recordingId) {
+          recordingState = stored;
+          retireRecordingState('Recording page is unavailable; committed chunks remain recoverable');
+          sendResponse(recordingState);
+        } else sendResponse(stored);
+      }).catch(() => sendResponse({ isRecording: false }));
       return true; // async
     }
     return true;
@@ -273,7 +296,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.scripting.executeScript(
         {
           target: { tabId: targetTabId },
-          files: ['muxer.js', 'content_script.js'],
+          files: ['webm_metadata.js', 'muxer.js', 'content_script.js'],
         },
         () => {
           if (chrome.runtime.lastError) {
@@ -320,32 +343,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendToTabId(message.targetTabId);
       return true;
     }
-    if (recordingState.isRecording && recordingState.tabId) {
-      sendToTabId(recordingState.tabId, () => {
-        chrome.tabs.query({ url: 'https://meet.google.com/*', active: true }, (tabs) => {
-          const target = tabs?.[0];
-          if (target) {
-            sendToTabId(target.id, () => {
-              chrome.tabs.query({ url: 'https://meet.google.com/*' }, (allTabs) => {
-                if (!allTabs?.length) {
-                  respondOnce({ ok: false, error: 'No Google Meet tab found' });
-                  return;
-                }
-                sendToTabId(allTabs[0].id);
-              });
-            });
-            return;
-          }
-
-          chrome.tabs.query({ url: 'https://meet.google.com/*' }, (allTabs) => {
-            if (!allTabs?.length) {
-              respondOnce({ ok: false, error: 'No Google Meet tab found' });
-              return;
-            }
-            sendToTabId(allTabs[0].id);
-          });
-        });
+    if (message.type === 'START_RECORDING') {
+      if (message.consentAcknowledged !== true) {
+        respondOnce({ ok: false, error: 'Confirm host and participant permission before recording' });
+        return true;
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+        const tab = tabs?.[0];
+        if (!tab || !isMeetUrl(tab.url)) respondOnce({ ok: false, error: 'Recording is available only on the active Google Meet website' });
+        else sendToTabId(tab.id);
       });
+      return true;
+    }
+    if (recordingState.isRecording && recordingState.tabId) {
+      sendToTabId(recordingState.tabId, () => respondOnce({ ok: false, error: 'Recording tab is unavailable; reopen Meet to recover saved chunks' }));
       return true;
     }
 
@@ -378,10 +389,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // ── Clear state when service worker restarts: reload from storage ─────────────
-chrome.storage.local.get('meetRecorderState', (data) => {
-  if (data.meetRecorderState) {
-    recordingState = data.meetRecorderState;
-  }
+const startupStateRevision = recordingStateRevision;
+chrome.storage.local.get('meetRecorderState', async data => {
+  const stored = data.meetRecorderState;
+  if (!stored) return;
+  const live = stored.isRecording ? await executionState(stored.tabId) : null;
+  if (startupStateRevision !== recordingStateRevision) return;
+  recordingState = stored;
+  if (stored.isRecording && !live?.unknown && live?.recordingId !== stored.recordingId) {
+    retireRecordingState('Recording page is unavailable; committed chunks remain recoverable');
+  } else recordingStateRevision++;
 });
 
 // Clean up state when tab closes
@@ -406,3 +423,24 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 console.log('[MeetRecorder] background service worker started ✓');
 listJobs().catch(() => {});
+
+// Eligibility is per tab; the inactive action default covers new/unknown tabs.
+function isMeetUrl(value) {
+  try { const url = new URL(value); return url.protocol === 'https:' && url.hostname === 'meet.google.com' && !url.port; }
+  catch (_) { return false; }
+}
+function updateAction(tabId, url) {
+  if (!chrome.action || !Number.isInteger(tabId)) return;
+  const eligible = isMeetUrl(url), path = {};
+  for (const size of [16, 48, 128]) path[size] = `icons/icon${size}${eligible ? '' : '-inactive'}.png`;
+  Promise.resolve(chrome.action.setIcon({ tabId, path })).catch(() => {});
+  Promise.resolve(chrome.action.setTitle({ tabId, title: eligible ? 'Meet Budy — Google Meet recording' : 'Meet Budy — unavailable on this website' })).catch(() => {});
+}
+chrome.tabs.query({}, tabs => { for (const tab of tabs || []) updateAction(tab.id, tab.url); });
+chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+  if (change.url || change.status === 'loading') updateAction(tabId, change.url || tab.url);
+  if (change.status === 'loading' && recordingState.tabId === tabId) retireRecordingState('Recording page changed; saved data remains recoverable');
+});
+chrome.tabs.onActivated.addListener(({ tabId }) => { chrome.tabs.get(tabId, tab => {
+  if (!chrome.runtime.lastError && tab) updateAction(tabId, tab.url);
+}); });

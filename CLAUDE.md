@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 "Meet Budy" — an unpacked Chrome MV3 extension that records Google Meet screen shares plus participant audio, entirely in-browser. No build step, no bundler, no package manager. To run it: load the folder via `chrome://extensions` → Developer Mode → Load unpacked. After any code change you must click the extension's reload icon **and** hard-refresh (`Ctrl+Shift+R`) any open Meet tab — content scripts only re-inject on a fresh page load.
 
-Run the source-executing lifecycle tests with `node --test tests/page-lifecycle.test.cjs tests/extension-lifecycle.test.cjs` (Node 18+; no package installation). The fixtures simulate browser/extension APIs and check resource ownership, event ordering, failures, and recovery. One test uses the optional installed ffmpeg core and skips when vendor files are absent. There is no lint config or CI. Native browser validation still requires recording a real Meet call and reading the popup Logs panel + the Meet tab's DevTools console (`[MeetRecorder]` / `[MeetBudyMuxer]` / `[ffmpeg]` prefixes). See `docs/memory-leak-fixes.md` for scope and verification limits.
+Run the source-executing lifecycle tests with `node --test tests/*.test.cjs` (Node 18+; no package installation). The fixtures simulate browser/extension APIs and check resource ownership, event ordering, failures, and recovery. One test uses the optional installed ffmpeg core and skips when vendor files are absent. There is no lint config or CI. Native browser validation still requires recording a real Meet call and reading the popup Logs panel + the Meet tab's DevTools console (`[MeetRecorder]` / `[MeetBudyMuxer]` / `[ffmpeg]` prefixes). See `docs/memory-leak-fixes.md` for scope and verification limits.
 
 ## Why the architecture is the way it is
 
@@ -15,7 +15,7 @@ Google Meet is WebRTC — there is no stream URL to grab. The only way to captur
 **Four execution contexts, each in its own file, talking only by message-passing:**
 
 - **`injected.js`** runs in the **page's main world** (injected as a `<script>` tag by content_script, because the extension's isolated world can't patch the page's `RTCPeerConnection`). This is where everything real happens: it patches `RTCPeerConnection` via `Reflect.construct` to capture every incoming audio/video track, builds the Web Audio mixing graph, runs the canvas compositor, and owns the `MediaRecorder`(s). ~2300 lines — the heart of the project. It cannot use any `chrome.*` API; it talks to the outside only via `window.postMessage` with `source: 'MEET_REC_PAGE'` (out) / `'MEET_REC_CMD'` (in).
-- **`content_script.js`** runs in the **extension's isolated world** on meet.google.com. It injects injected.js, bridges page↔extension messages, owns IndexedDB chunk assembly + the WebM duration fixer, triggers downloads, and drives the optional ffmpeg mux. Has `chrome.*` access.
+- **`content_script.js`** runs in the **extension's isolated world** on meet.google.com. It injects injected.js, bridges page↔extension messages, owns IndexedDB chunk assembly, calls `webm_metadata.js` for complete-container metadata, triggers downloads, and drives the optional ffmpeg mux. Has `chrome.*` access.
 - **`background.js`** is the service worker — it relays messages, persists `recordingState`, serializes revision-checked mutations of per-recording recovery jobs, and routes saved-recording actions to a tab with the matching storage origin. Accepted combine claims have execution tokens plus actual tab/document ownership, separate from immutable recording source ownership. Only the matching accepted owner may release a claim; liveness queries reconcile claims after close/reload/restart and preserve unknown owners conservatively.
 - **`popup/`** is the UI (vanilla HTML/CSS/JS, no framework). Sends commands, renders state, manages the audio-track and VIP configuration.
 
@@ -35,7 +35,7 @@ Each accepted recording session owns immutable IDs/output metadata, its recorder
 
 ## The mux pipeline (`muxer.js` + `vendor/ffmpeg/`)
 
-ffmpeg.wasm remuxes the N raw files into a single MKV with all audio tracks **and** fixes the cluster timestamps that make chunked MediaRecorder output unplayable in WMP/VLC. It is strictly optional: if `vendor/ffmpeg/ffmpeg-core.js` + `.wasm` are absent, `isAvailable()` returns false — raw files remain available. The `RECORDING_STOPPED` handler in content_script.js is deliberately ordered **raw-save first, mux second, clear IDB last**. Capture the exact mux API for an operation and terminate it in finally. Its stable installation guard, cancellation/deadlines, partial-allocation disposer, and worker filesystem finally must release failed or abandoned work.
+ffmpeg.wasm remuxes the N raw files into a single MKV with all audio tracks **and** fixes the cluster timestamps that make chunked MediaRecorder output unplayable in WMP/VLC. It is strictly optional: if `vendor/ffmpeg/ffmpeg-core.js` + `.wasm` are absent, `isAvailable()` returns false — raw files remain available. The `RECORDING_STOPPED` handler in content_script.js is deliberately ordered **raw-save first, mux second, clear IDB last**. Raw main and secondary outputs first pass through `MeetBudyMetadata.finalize`, which builds a finite Segment, media-timestamp Duration, SeekHead and real Cues while preserving encoded blocks as Blob slices. Do not restore the first-chunk duration patcher or estimate duration from recovery wall time. Use the returned container MIME/extension; metadata failure must retain recovery data and report an honest warning. Capture the exact mux API for an operation and terminate it in finally. Its stable installation guard, cancellation/deadlines, partial-allocation disposer, and worker filesystem finally must release failed or abandoned work.
 
 Critical MV3 gotcha already solved here: a content script **cannot** `new Worker('chrome-extension://...')` — Worker construction is gated by the page origin. So muxer.js `fetch()`es the core JS as text + wasm as bytes and builds a **Blob-URL worker** with the core inlined and the wasm passed via `wasmBinary`. Don't refactor this back to a direct extension-URL worker.
 
@@ -45,7 +45,7 @@ $dest = "vendor\ffmpeg"; $base = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd
 Invoke-WebRequest "$base/ffmpeg-core.js"   -OutFile "$dest\ffmpeg-core.js"
 Invoke-WebRequest "$base/ffmpeg-core.wasm" -OutFile "$dest\ffmpeg-core.wasm"
 ```
-(0.12.x has no separate `worker.js`.) Output files: `*_full.mkv` (main), `*_track-N-NAME.webm` (each extra audio), `*_combined.mkv` (muxed).
+(0.12.x has no separate `worker.js`.) Output files: `*_full.webm` or `*_full.mkv` according to the container and codecs (main), `*_track-N-NAME.webm` for WebM audio (each extra output), `*_combined.mkv` (optional muxed output).
 
 ## Google Meet DOM is unstable — treat it as hostile
 
@@ -61,3 +61,11 @@ Meet's DOM changes often and **virtualizes participant tiles**: in an 80+ person
 - The canvas compositor runs at 30fps and the audio analysers poll on timers — on mobile (e.g. Mises browser) or large meetings this is the main cause of lag; multiple parallel MediaRecorders compound it.
 - Speaker overlay cards render only when **no** screen share is active (so they don't cover slides); see the `showingScreen` guard in `drawCompositorFrame`.
 - Lifecycle tests cover retirement of track nodes/sinks/probes/listeners, session rollback/finalization, worker/URL disposal, and saved-recording ownership. Reusable live-media AudioContext/source/mixer services are intentional page-lifetime resources. Genuine Meet/Chrome heap, native media allocation, output playback, and long-session behavior still require manual validation; popup state under those native schedules has not been comprehensively measured.
+
+## Recording safety and availability
+
+The popup requires a fresh host/participant permission acknowledgement for Start and displays the personal-use restriction. Background allows Start only on the active HTTPS Google Meet tab. Stop and saved-job actions retain explicit recording ownership. Toolbar availability is per tab, with grayscale defaults for unsupported sites.
+
+Incoming meeting-media availability drives a 10-second Stop countdown, including while paused. Generated compositor/mixer tracks, local microphone/preview tracks and extension sinks cannot keep the meeting alive. Silent audio and static presentations remain available media. Preserve receiver/source ownership across temporary ICE failures so a reconnect can cancel the countdown.
+
+Request `beforeunload` confirmation while starting, recording, finalizing or saving; never stop on a cancelled close attempt. `pagehide` can flush best-effort on actual teardown. Chrome controls dialog policy; forced shutdown bypasses it. Recorder stop and storage flush have bounded waits; timed-out completion is incomplete and must retain committed chunks for recovery. A late callback cannot reset a later session. See `docs/recording-safety-compatibility.md` for native checks and limits.

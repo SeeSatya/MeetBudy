@@ -197,7 +197,7 @@ test('Rejected duplicate bridge START preserves current recording identity', asy
   const e = environment(); await e.page('RECORDING_STARTED', { recordingId: 'A', mimeType: 'video/x-matroska' });
   const response = (await e.command('START_RECORDING'))[0];
   assert.equal(response.ok, false); assert.equal(e.window.__content.state().currentRecordingId, 'A');
-  e.seed('A'); await e.page('RECORDING_STOPPED', { recordingId: 'A', mimeType: 'video/x-matroska', secondaries: [] });
+  e.seed('A',2,{matroska:true}); await e.page('RECORDING_STOPPED', { recordingId: 'A', mimeType: 'video/x-matroska', secondaries: [] });
   assert.equal(e.group.db.rows.length, 0);
   assert(e.document.all.some(el => el.download?.endsWith('.mkv')));
 });
@@ -427,6 +427,7 @@ test('Other-tab status and chunk broadcasts cannot reset the selected recording 
 
 test('Started recording restores the enabled Stop control after async START', async () => {
   const e = environment(); await e.page('INJECTED'); const ui = await popup(e);
+  e.document.get('consentAcknowledged').checked=true;
   await e.document.get('btnRecord').click(); await drain();
   assert.equal(e.document.get('btnRecord').attrs.disabled, 'true');
   const start = e.posts.find(post => post.cmd === 'START'); assert(start);

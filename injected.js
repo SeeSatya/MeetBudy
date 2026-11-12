@@ -186,14 +186,20 @@
     });
   }
 
-  function writeChunkToDB(recordingId, chunkData) {
-    return openIDB().then(db => writeChunkOnce(db, recordingId, chunkData))
+  function writeChunkToDB(recordingId, chunkData, session) {
+    const write = db => {
+      // A timed-out open/reopen must not create a new transaction after the
+      // saved session has been recovered and its committed chunks deleted.
+      if (session.disposed) throw new Error('Recording session finalized before chunk write');
+      return writeChunkOnce(db, recordingId, chunkData);
+    };
+    return openIDB().then(write)
       .catch(err => {
         if (!isIDBConnClosing(err)) throw err;
         // Stale connection — forget it and retry once with a fresh handle.
         console.warn('[MeetRecorder] IDB connection was closing, reopening…');
         resetIDB();
-        return openIDB().then(db => writeChunkOnce(db, recordingId, chunkData));
+        return openIDB().then(write);
       });
   }
 
@@ -2131,6 +2137,74 @@
     }
   }
 
+  // Incoming availability is independent of the generated compositor/mixer and
+  // of audible volume: a silent microphone or static presentation is still live.
+  function hasIncomingMeetingMedia() {
+    const local = new Set();
+    for (const pc of activePeerConnections) {
+      try { for (const sender of pc.getSenders()) if (sender.track) local.add(sender.track.id); } catch (_) {}
+    }
+    if (currentLocalMicTrack) local.add(currentLocalMicTrack.id);
+    for (const track of [...audioTracks.values(), ...allVideoTracks]) {
+      if (track.readyState !== 'live' || track.muted || local.has(track.id)) continue;
+      const owners = observedTrackOwners.get(track.id);
+      if (owners?.size) {
+        if ([...owners].some(pc => activePeerConnections.has(pc) && !['closed', 'failed', 'disconnected'].includes(pc.connectionState))) return true;
+      } else {
+        // DOM recovery for a connection established before this script loaded.
+        // Hidden extension sinks/probes and local previews cannot extend a call.
+        for (const el of document.querySelectorAll('video, audio')) {
+          if (!el.isConnected || [...trackSinkEls.values()].includes(el) || [...videoProbes.values()].includes(el)) continue;
+          const tile = el.closest?.('[data-participant-id]');
+          if (tile && (SELF_MARKER_RE.test(tile.textContent || '') || tile.querySelector?.('[data-self-name]') || tile.hasAttribute?.('data-self-name'))) continue;
+          if (el.srcObject?.getTracks?.().some(t => t.id === track.id)) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function monitorMeetingMedia(session) {
+    const tick = () => {
+      session.activityTimer = null;
+      if (activeRecordingSession !== session || session.state !== 'recording') return;
+      if (hasIncomingMeetingMedia()) {
+        if (session.lossAt !== null) postOut('MEETING_ACTIVITY', { recordingId: session.id, state: 'activity_restored', message: 'Meeting media restored; recording continues.' });
+        session.lossAt = null;
+        session.lossSeconds = null;
+      } else {
+        if (session.lossAt === null) session.lossAt = Date.now();
+        const remaining = Math.max(0, Math.ceil((10000 - (Date.now() - session.lossAt)) / 1000));
+        if (remaining !== session.lossSeconds) postOut('MEETING_ACTIVITY', { recordingId: session.id, state: 'activity_countdown', seconds: remaining,
+          message: `No incoming meeting media. Saving recording in ${remaining} seconds…` });
+        session.lossSeconds = remaining;
+        if (!remaining) { finalizeRecording(session); return; }
+      }
+      session.activityTimer = setTimeout(tick, 1000);
+    };
+    tick();
+  }
+
+  function waitForFinalization(promise, session, timeoutMs, reason) {
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        session.incomplete = true;
+        postOut('WARN', reason + '; committed chunks remain recoverable.');
+        resolve(false);
+      }, timeoutMs);
+      Promise.resolve(promise).then(() => { clearTimeout(timer); resolve(true); }, () => { clearTimeout(timer); session.incomplete = true; resolve(false); });
+    });
+  }
+
+  window.addEventListener('beforeunload', event => {
+    if (!activeRecordingSession) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
+  window.addEventListener('pagehide', event => {
+    if (!event.persisted && activeRecordingSession) finalizeRecording(activeRecordingSession);
+  });
+
   function recordingAudioTracks() {
     return activeRecordingSession?.outputs || customAudioTracks;
   }
@@ -2161,6 +2235,8 @@
   function cleanupRecordingResources(session = activeRecordingSession) {
     if (!session || session.disposed) return;
     session.disposed = true;
+    clearTimeout(session.activityTimer);
+    session.activityTimer = null;
     session.recorders.forEach(entry => {
       entry.recorder.ondataavailable = null;
       entry.recorder.onerror = null;
@@ -2194,10 +2270,10 @@
 
   function persistRecordingChunk(session, entry, blob) {
     if (!blob || blob.size === 0 || session.disposed) return;
-    const write = writeChunkToDB(entry.recordingId, blob).then(() => {
+    const write = writeChunkToDB(entry.recordingId, blob, session).then(() => {
       entry.chunksSaved++;
       entry.bytesSaved += blob.size;
-      if (entry === session.main) {
+      if (entry === session.main && activeRecordingSession === session && !session.disposed) {
         chunksSaved = entry.chunksSaved;
         bytesSaved = entry.bytesSaved;
         postOut('CHUNK_SAVED', {
@@ -2208,7 +2284,7 @@
       }
     }).catch(err => {
       session.writeFailed = true;
-      postOut('ERROR', `Chunk save failed (${entry.recordingId}): ${err?.message || err}`);
+      if (!session.disposed) postOut('ERROR', `Chunk save failed (${entry.recordingId}): ${err?.message || err}`);
     });
     session.writes.add(write);
     write.then(() => session.writes.delete(write));
@@ -2264,6 +2340,9 @@
     }
     if (session.finalization) return session.finalization;
     session.state = 'finalizing';
+    session.stoppedAt = Date.now();
+    clearTimeout(session.activityTimer);
+    session.activityTimer = null;
     if (activeRecordingSession === session) {
       isRecording = false;
       stopCompositorLoop();
@@ -2277,11 +2356,11 @@
     session.finalization = new Promise(resolve => { finish = resolve; });
     session.recorders.forEach(stopSessionRecorder);
     (async () => {
-      await Promise.all(session.recorders.map(entry => entry.stoppedPromise));
+      await waitForFinalization(Promise.all(session.recorders.map(entry => entry.stoppedPromise)), session, 5000, 'Final recorder callbacks timed out');
       // Native capture can retire once final media events arrive, even when
       // storage is slow. Keep session identity/handlers until accepted writes drain.
       releaseSessionCapture(session);
-      while (session.writes.size) await Promise.all(Array.from(session.writes));
+      await waitForFinalization((async () => { while (session.writes.size) await Promise.all(Array.from(session.writes)); })(), session, 10000, 'Recording storage flush timed out');
       const main = session.main;
       const data = {
         recordingId: session.id,
@@ -2289,6 +2368,7 @@
         totalChunks: main?.chunksSaved || 0,
         totalMB: ((main?.bytesSaved || 0) / 1_048_576).toFixed(2),
         writeFailed: session.writeFailed,
+        incomplete: !!session.incomplete, stoppedAt: session.stoppedAt, startTime: session.startTime,
         secondaries: session.recorders.filter(entry => entry !== main && entry.started).map(entry => ({
           trackId: entry.trackId, name: entry.name, recordingId: entry.recordingId,
           mimeType: entry.mimeType, chunks: entry.chunksSaved,
@@ -2317,6 +2397,7 @@
       })),
       recorders: [], main: null, writes: new Set(), kickNodes: [],
       started: false, writeFailed: false, disposed: false,
+      activityTimer: null, lossAt: null, lossSeconds: null, startTime: Date.now(),
     };
     // Synchronous reservation precedes allocation and the first await.
     activeRecordingSession = session;
@@ -2422,8 +2503,9 @@
       startCompositorLoop(drawCompositorFrame);
       postOut('RECORDING_STARTED', {
         mimeType: session.mimeType, hasVideo: true, hasAudio: stream.getAudioTracks().length > 0,
-        audioSources: audioSources.size, recordingId: session.id,
+        audioSources: audioSources.size, recordingId: session.id, startTime: session.startTime,
       });
+      monitorMeetingMedia(session);
     } catch (err) {
       postOut('ERROR', `Recording startup failed: ${err.message}`);
       await finalizeRecording(session);
