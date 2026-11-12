@@ -16,6 +16,23 @@ test('Toolbar availability follows exact Meet host navigation and active tab',as
   group.updateTab(e.id,'https://meet.google.com/abc-defg-hij');assert(group.actionCalls.findLast(x=>x.type==='icon').path[128].endsWith('icon128.png'));
 });
 
+test('Toolbar restores its icon after navigation completes without a URL change event',async()=>{
+  const group=cluster(),e=environment({group});
+  for(const url of ['https://meet.google.com/', 'https://meet.google.com/abc-defg-hij?authuser=1', 'https://example.com/']) {
+    group.updateTab(e.id,url);
+    // Chrome can reset the per-tab icon to the manifest default on navigation.
+    // Completion reports only status, so it must set the icon again.
+    group.actionCalls.length=0;
+    group.updateTab(e.id,url,'complete');
+    const icon=group.actionCalls.findLast(x=>x.type==='icon');assert(icon);
+    assert.equal(icon.tabId,e.id);
+    const suffix=url.startsWith('https://meet.google.com/') ? '' : '-inactive';
+    for(const size of [16,48,128]) assert.equal(icon.path[size],`icons/icon${size}${suffix}.png`);
+  }
+  group.actionCalls.length=0;group.restartBackground();await drain();
+  assert(group.actionCalls.some(x=>x.type==='icon'&&x.tabId===e.id));
+});
+
 test('START always checks consent and active site even when another tab is recording',async()=>{
   const group=cluster(),meet=environment({group,id:7}),offsite=environment({group,id:8});await meet.page('RECORDING_STARTED',{recordingId:'active'});
   group.updateTab(8,'https://example.com/');group.activateTab(8);

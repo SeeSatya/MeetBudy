@@ -438,7 +438,9 @@ function updateAction(tabId, url) {
 }
 chrome.tabs.query({}, tabs => { for (const tab of tabs || []) updateAction(tab.id, tab.url); });
 chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
-  if (change.url || change.status === 'loading') updateAction(tabId, change.url || tab.url);
+  // Chrome resets tab-specific action icons on navigation. Reapply at completion
+  // as well as loading, when a pending/new tab's committed URL is available.
+  if (change.url || change.status) updateAction(tabId, change.url || tab.url || tab.pendingUrl);
   if (change.status === 'loading' && recordingState.tabId === tabId) retireRecordingState('Recording page changed; saved data remains recoverable');
 });
 chrome.tabs.onActivated.addListener(({ tabId }) => { chrome.tabs.get(tabId, tab => {

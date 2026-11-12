@@ -103,7 +103,7 @@ function cluster() {
   const restartBackground = () => vm.runInNewContext(source('background.js'), { chrome, console: quiet, URL, Date, Promise, Map, setTimeout, clearTimeout });
   restartBackground();
   function dispatch(message, sender = {}) { return new Promise(resolve => { const async = handler(message, sender, resolve); if (async !== true) resolve(undefined); }); }
-  return { actionCalls, updateTab(id,url,status='loading') { const tab=tabs.get(id); tab.url=url; onUpdated?.(id,{url,status},tab); }, activateTab(id) { for(const tab of tabs.values()) tab.active=tab.id===id; onActivated?.({tabId:id}); }, stored, db, tabs, local, changes, dispatch, backgroundMessages, chrome, restartBackground, removeTab(id) { tabs.delete(id); onRemoved?.(id); }, jobKeys() { return Object.keys(stored).filter(k => k.startsWith('meetBudyPendingCombine:')); } };
+  return { actionCalls, updateTab(id,url,status='loading') { const tab=tabs.get(id), change={status}; if(url!==tab.url) change.url=url; tab.url=url; onUpdated?.(id,change,tab); }, activateTab(id) { for(const tab of tabs.values()) tab.active=tab.id===id; onActivated?.({tabId:id}); }, stored, db, tabs, local, changes, dispatch, backgroundMessages, chrome, restartBackground, removeTab(id) { tabs.delete(id); onRemoved?.(id); }, jobKeys() { return Object.keys(stored).filter(k => k.startsWith('meetBudyPendingCombine:')); } };
 }
 function environment({ group = cluster(), id = 7, mode = 'success', bootContent = true } = {}) {
   const time = clock(), document = dom(), posts = [], sent = [], workers = [], urls = new Map(), pageListeners = [], runtimeListeners = [];

@@ -24,8 +24,12 @@
   const statVips           = document.getElementById('statVips');
   
   const linkSettings       = document.getElementById('linkSettings');
+  const linkDisclaimer     = document.getElementById('linkDisclaimer');
   const linkLogs           = document.getElementById('linkLogs');
   const panelSettings      = document.getElementById('panelSettings');
+  const panelDisclaimer    = document.getElementById('panelDisclaimer');
+  const btnDisclaimerOk    = document.getElementById('btnDisclaimerOk');
+  const disclaimerSaveError = document.getElementById('disclaimerSaveError');
   const panelLogs          = document.getElementById('panelLogs');
   
   const toggleAdvanceMode  = document.getElementById('toggleAdvanceMode');
@@ -67,6 +71,7 @@
   const modalVipList       = document.getElementById('modalVipList');
   const btnCancelVip       = document.getElementById('btnCancelVip');
   const PENDING_COMBINE_KEY = 'meetBudyPendingCombine:';
+  const DISCLAIMER_ACKNOWLEDGED_KEY = 'meetBudyDisclaimerAcknowledged';
   const pendingRecordingSelect = document.getElementById('pendingRecordingSelect');
 
   // ─── Constants ───────────────────────────────────────────────────────────
@@ -505,6 +510,12 @@
   }
 
   // ─── State Persistence ───────────────────────────────────────────────────
+  function showDisclaimer() {
+    disclaimerSaveError.hidden = true;
+    panelDisclaimer.classList.add('visible');
+    btnDisclaimerOk.focus?.();
+  }
+
   function saveState() {
     chrome.storage.local.set({
       meetBudyTracks:        audioTracks,
@@ -523,6 +534,7 @@
       'meetBudyTracks', 'meetBudyVips', 'meetBudyAdvanceMode',
       'meetBudyToggleMyMic', 'meetBudyToggleVoices',
       'meetBudyToggleVips',  'meetBudyToggleStreams',
+      DISCLAIMER_ACKNOWLEDGED_KEY,
     ];
     chrome.storage.local.get(KEYS, (data) => {
       if (data.meetBudyTracks) audioTracks = data.meetBudyTracks;
@@ -543,6 +555,9 @@
       syncCardStyles();
 
       if (callback) callback();
+      // Local storage survives popup/browser restarts and extension updates.
+      // Closing the popup without OK leaves the first-use notice unacknowledged.
+      if (data[DISCLAIMER_ACKNOWLEDGED_KEY] !== true) showDisclaimer();
     });
   }
 
@@ -903,9 +918,28 @@
       });
     }
 
-    // Settings & Logs open as themed modals
+    // Settings, Disclaimer & Logs open as themed modals
     linkSettings.addEventListener('click', () => panelSettings.classList.add('visible'));
+    linkDisclaimer.addEventListener('click', showDisclaimer);
     linkLogs.addEventListener('click', () => panelLogs.classList.add('visible'));
+    btnDisclaimerOk.addEventListener('click', () => {
+      btnDisclaimerOk.disabled = true;
+      chrome.storage.local.set({ [DISCLAIMER_ACKNOWLEDGED_KEY]: true }, () => {
+        btnDisclaimerOk.disabled = false;
+        if (chrome.runtime.lastError) {
+          disclaimerSaveError.textContent = 'Could not save your acknowledgement. Please click OK to try again.';
+          disclaimerSaveError.hidden = false;
+          return;
+        }
+        panelDisclaimer.classList.remove('visible');
+        if (modalCombine?.classList.contains('visible')) btnCombineNow.focus?.();
+        else linkDisclaimer.focus?.();
+      });
+    });
+    // Keep keyboard navigation inside this one-button dialog.
+    panelDisclaimer.addEventListener('keydown', e => {
+      if (e.key === 'Tab') { e.preventDefault(); btnDisclaimerOk.focus?.(); }
+    });
 
     // Generic close handlers (data-close="modalId")
     document.querySelectorAll('[data-close]').forEach(el => {
@@ -914,8 +948,9 @@
         if (target) target.classList.remove('visible');
       });
     });
-    // Click outside the .modal closes the overlay
+    // The disclaimer is dismissed explicitly with OK.
     document.querySelectorAll('.modal-overlay').forEach(overlay => {
+      if (overlay === panelDisclaimer) return;
       overlay.addEventListener('click', (e) => {
         if (e.target === overlay) overlay.classList.remove('visible');
       });

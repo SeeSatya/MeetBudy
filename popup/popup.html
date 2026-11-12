@@ -174,7 +174,7 @@
       text-transform: uppercase;
       white-space: nowrap;
     }
-    .stats-menu-row { flex-wrap: nowrap; gap: 10px; }
+    .stats-menu-row { flex-wrap: wrap; gap: 10px; }
     .menu-right { white-space: nowrap; }
     .stats-left strong {
       color: var(--stat-pink);
@@ -190,6 +190,11 @@
       gap: 14px;
     }
     .menu-link {
+      background: transparent;
+      border: none;
+      padding: 0;
+      font: inherit;
+      letter-spacing: inherit;
       color: var(--text-muted);
       text-decoration: none;
       cursor: pointer;
@@ -201,6 +206,23 @@
     .menu-link.active {
       color: var(--accent);
     }
+    .menu-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    .recording-permission {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      font-size: 11px;
+      line-height: 1.5;
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+    .recording-permission input { margin-top: 3px; accent-color: var(--accent); }
+    #panelDisclaimer { z-index: 1001; }
+    .disclaimer-copy { font-size: 12px; line-height: 1.6; color: var(--text-muted); }
+    .disclaimer-copy p + p { margin-top: 12px; }
+    .disclaimer-copy strong { color: var(--text-primary); }
+    .disclaimer-footer { justify-content: flex-end; }
+    #disclaimerSaveError { margin-top: 12px; color: var(--red); }
 
     #logContainer {
       font-family: 'JetBrains Mono', Consolas, monospace;
@@ -635,11 +657,6 @@
   </style>
 </head>
 <body>
-  <div class="top-control-card" role="note" aria-label="Recording permission warning">
-    <p style="font-size:12px;line-height:1.5"><strong>Permission required.</strong> Do not record without explicit permission from the meeting host and participants. This extension is for personal use only. Do not sell it or its recordings, use them commercially, or spam.</p>
-    <label style="font-size:12px;line-height:1.5;cursor:pointer"><input id="consentAcknowledged" type="checkbox"> I have permission for this recording and agree to personal use only.</label>
-  </div>
-
   <!-- ── Top Control Card ────────────────────────────────────── -->
   <div class="top-control-card">
     <div class="top-row">
@@ -673,8 +690,30 @@
         <span class="vip-label">VIP :<strong id="statVips">0</strong></span>
       </div>
       <div class="menu-right">
-        <span id="linkSettings" class="menu-link">Settings</span>
-        <span id="linkLogs" class="menu-link">Logs</span>
+        <button id="linkSettings" type="button" class="menu-link">Settings</button>
+        <button id="linkDisclaimer" type="button" class="menu-link" aria-haspopup="dialog" aria-controls="panelDisclaimer">Disclaimer</button>
+        <button id="linkLogs" type="button" class="menu-link">Logs</button>
+      </div>
+    </div>
+    <label class="recording-permission"><input id="consentAcknowledged" type="checkbox"> I have permission from the host and participants to record this meeting.</label>
+  </div>
+
+  <!-- ── Disclaimer Modal ────────────────────────────────────── -->
+  <div id="panelDisclaimer" class="modal-overlay">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="disclaimerTitle" aria-describedby="disclaimerText">
+      <div class="modal-header">
+        <div id="disclaimerTitle" class="modal-title">Disclaimer</div>
+      </div>
+      <div class="modal-body disclaimer-copy">
+        <div id="disclaimerText">
+          <p><strong>Get permission before recording.</strong> Record a meeting only with explicit permission from the host and participants. Respect their privacy and follow the recording laws that apply to you.</p>
+          <p><strong>Personal use only.</strong> Do not sell this extension or its recordings, use them commercially, or use them for spam.</p>
+          <p>You are responsible for how you record, use, and share meeting content.</p>
+        </div>
+        <p id="disclaimerSaveError" role="alert" hidden></p>
+      </div>
+      <div class="modal-footer disclaimer-footer">
+        <button id="btnDisclaimerOk" type="button" class="btn-text accent">OK</button>
       </div>
     </div>
   </div>
