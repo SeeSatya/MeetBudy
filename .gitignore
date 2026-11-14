@@ -14,6 +14,9 @@
 !.env.example
 !.env.*.example
 *.pem
+*.key
+*.p12
+*.pfx
 
 # Operating system files
 .DS_Store
@@ -30,6 +33,8 @@ coverage/
 test-results/
 playwright-report/
 blob-report/
+/artifacts/
+/browser-profiles/
 
 # Logs, temporary files, and editor backups
 *.log
@@ -53,5 +58,6 @@ blob-report/
 
 # Locally downloaded recordings (keep source and documentation assets visible)
 /recordings/
+/downloads/
 meet-recording-*.webm
 meet-recording-*.mkv

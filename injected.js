@@ -117,6 +117,8 @@
   let localMicAnalyser = null;
   let localMicVolume = 0;
   const audioTrackToParticipant = new Map(); // trackId -> { name, avatarUrl }
+  const localAudioBindings = new Set(); // Incoming tracks currently bound to self UI; never correlate these.
+  let participantRoutingDirty = false;
 
   // IndexedDB database instance
   let idb = null;
@@ -359,6 +361,7 @@
     });
 
     console.log('[MeetRecorder] WebAudio graph connections rebuilt successfully.');
+    participantRoutingDirty = false;
   }
 
   function updateTrackGains() {
@@ -546,8 +549,10 @@
     const streamId = trackStreamMap.get(trackId);
     trackStreamMap.delete(trackId);
     audioTrackToParticipant.delete(trackId);
+    localAudioBindings.delete(trackId);
     lastResolveTime.delete(trackId);
     trackCorrelation.delete(trackId);
+    activeSpeakers.delete(`track:${trackId}`);
     participantTileCache.delete(`track:${trackId}`);
     if (streamId && !Array.from(trackStreamMap.values()).includes(streamId)) {
       participantTileCache.delete(streamId);
@@ -735,13 +740,125 @@
   }
 
   // ─── Screen Share Detection & Handling ─────────────────────────────────────
-  function confirmScreenShare(track, method, extra = {}) {
+  const SCREEN_SHARE_HINT_RE = /\b(?:present(?:ation|ing)?|screen(?:share|sharing)?|sharing|shared|tab|window|display|monitor|desktop)\b/i;
+  const DOM_SCREEN_SHARE_HINT_RE = /^(?:presentation|screen\s*(?:share|sharing)?|shared\s+(?:screen|tab|window)|(?:tab|window|desktop)\s+(?:share|sharing))(?:\s*$|\s*[:(—-]|\s+(?:by|from|for)\b)|\b(?:is|are)\s+presenting\b|\b(?:is|are)\s+sharing\s+(?:(?:their|the|a)\s+)?(?:screen|tab|window)\b/i;
+  const CAMERA_HINT_RE = /\b(?:camera|webcam)\b/i;
+  const screenShareHints = new WeakMap();
+  const videoProbeChecks = new Map();
+
+  function videoContainsTrack(video, track) {
+    try {
+      return !!video?.isConnected && !!video.srcObject?.getVideoTracks?.().some(t => t.id === track.id);
+    } catch (_) { return false; }
+  }
+
+  function getScreenShareEvidence(track, vid = null) {
+    let settings = {};
+    try { settings = track.getSettings?.() || {}; } catch (_) {}
+    let hint = SCREEN_SHARE_HINT_RE.test(track.label || '') ? 'label' : null;
+    if (!hint && (track.contentHint === 'detail' || track.contentHint === 'text')) hint = 'contentHint';
+    if (!hint && settings.displaySurface) hint = 'displaySurface';
+    const candidates = [vid, domVideoElements.get(track.id)];
+    if (!hint) {
+      // Receiver events need camera/presentation semantics even before a DOM
+      // candidate has been cached. Inspect only videos carrying this track.
+      for (const video of document.querySelectorAll('video')) {
+        if (video !== videoProbes.get(track.id) && videoContainsTrack(video, track)) candidates.push(video);
+      }
+    }
+    const videos = [...new Set(candidates)].filter(video => videoContainsTrack(video, track));
+    let camera = !!settings.facingMode || track.contentHint === 'motion' || CAMERA_HINT_RE.test(track.label || '');
+    if (!hint) {
+      // Look past incidental labels (e.g. participant controls) to the presentation region.
+      for (const video of videos) {
+        const tile = video.closest('[data-participant-id]');
+        if (video.closest('[data-self-name]') || (tile && (SELF_MARKER_RE.test(tile.textContent || '') ||
+            tile.hasAttribute?.('data-self-name') || tile.querySelector?.('[data-self-name]')))) camera = true;
+        const labels = [video.getAttribute('aria-label'), video.closest('[aria-label]')?.getAttribute('aria-label'),
+          video.closest('[aria-label*="present" i], [aria-label*="screen" i], [aria-label*="sharing" i], [aria-label*="shared" i]')?.getAttribute('aria-label'),
+          video.closest('[aria-label*="camera" i], [aria-label*="webcam" i]')?.getAttribute('aria-label')];
+        // A participant-bearing label can match closest() before the actual
+        // presentation region. Inspect each ancestor's own label as well.
+        for (let parent = video.parentElement; parent && parent !== document.body && parent !== document.documentElement; parent = parent.parentElement) {
+          labels.push(parent.getAttribute?.('aria-label'));
+        }
+        if (labels.some(label => CAMERA_HINT_RE.test(label || ''))) camera = true;
+        // UI labels often contain participant names. Words such as "Tab" in
+        // "Camera for Tab Hunter" do not describe the media's purpose.
+        if (labels.some(label => DOM_SCREEN_SHARE_HINT_RE.test(label || ''))) { hint = 'dom_semantics'; break; }
+      }
+    }
+    // Use a complete decoded pair when available; settings are only a fallback.
+    // Layout/viewport size says nothing about the source's resolution.
+    const decoded = videos.find(video => video.videoWidth > 0 && video.videoHeight > 0);
+    const width = decoded ? decoded.videoWidth : (settings.width || 0);
+    const height = decoded ? decoded.videoHeight : (settings.height || 0);
+    return { hint, camera: camera && !hint, settings, width, height,
+      highResolution: !camera && width >= 1280 && height >= 720 };
+  }
+
+  function isLocalCameraPreview(track, vid = null) {
+    for (const pc of activePeerConnections) {
+      try { if (pc.getSenders().some(sender => sender.track?.id === track.id)) return true; } catch (_) {}
+    }
+    const videos = vid ? [vid] : document.querySelectorAll('video');
+    for (const video of videos) {
+      if (!video.isConnected || videoProbes.get(track.id) === video) continue;
+      if (!video.srcObject?.getVideoTracks?.().some(t => t.id === track.id)) continue;
+      const tile = video.closest('[data-participant-id]');
+      if (video.closest('[data-self-name]') || (tile && (SELF_MARKER_RE.test(tile.textContent || '') ||
+          tile.hasAttribute?.('data-self-name') || tile.querySelector?.('[data-self-name]')))) return true;
+    }
+    return false;
+  }
+
+  function confirmScreenShare(track, method, extra = {}, hasScreenHint = null) {
+    const evidence = getScreenShareEvidence(track);
+    if (hasScreenHint === null) hasScreenHint = !!evidence.hint || (!evidence.camera && !!screenShareHints.get(track));
+    if (forceNoScreenShare || track.readyState !== 'live') return false;
+    if (recordingCanvasStream?.getVideoTracks().some(t => t.id === track.id)) return false;
+    if (!hasScreenHint && (evidence.camera || isLocalCameraPreview(track))) return false;
+    // A webcam/probe meeting the resolution fallback must not displace a live share.
+    if (!hasScreenHint && screenShareTrack?.readyState === 'live' &&
+        screenShareTrack.id !== track.id) return false;
+    if (hasScreenHint && screenShareHints.get(track) && screenShareTrack?.readyState === 'live' &&
+        screenShareTrack.id !== track.id && activeScreenShareTracks.some(candidate => candidate.id === track.id)) {
+      const currentEvidence = getScreenShareEvidence(screenShareTrack);
+      // Validation of a previously confirmed share is not a new selection.
+      // Preserve the selected presentation, including while its first frames load.
+      if (!currentEvidence.camera && (screenShareHints.get(screenShareTrack) || currentEvidence.hint)) return true;
+    }
+    if (hasScreenHint) {
+      screenShareHints.set(track, true);
+      // Do not revive an older resolution-only camera when the explicit share ends.
+      for (let i = activeScreenShareTracks.length - 1; i >= 0; i--) {
+        const candidate = activeScreenShareTracks[i];
+        if (candidate !== track && !screenShareHints.get(candidate) && !getScreenShareEvidence(candidate).hint) {
+          activeScreenShareTracks.splice(i, 1);
+          probeDisposers.get(candidate.id)?.();
+        }
+      }
+    }
     if (!activeScreenShareTracks.includes(track)) {
       activeScreenShareTracks.push(track);
     }
     if (screenShareTrack?.id !== track.id) {
       screenShareTrack = track;
       postOut('SCREEN_SHARE_DETECTED', { trackId: track.id, method, ...extra });
+    }
+    return true;
+  }
+
+  function rejectScreenShare(track, reason = 'resolution_below_720p') {
+    screenShareHints.delete(track);
+    const index = activeScreenShareTracks.indexOf(track);
+    if (index !== -1) activeScreenShareTracks.splice(index, 1);
+    if (screenShareTrack?.id !== track.id) return;
+    screenShareTrack = activeScreenShareTracks[activeScreenShareTracks.length - 1] || null;
+    if (screenShareTrack) {
+      postOut('SCREEN_SHARE_DETECTED', { trackId: screenShareTrack.id, method: 'fallback_active_track' });
+    } else {
+      postOut('SCREEN_SHARE_ENDED', { trackId: track.id, reason });
     }
   }
 
@@ -757,39 +874,25 @@
 
   function getVideoElementForScreenShare(trackId) {
     const probeVid = videoProbes.get(trackId);
-    if (probeVid && probeVid.readyState >= 2) return probeVid;
+    if (probeVid && videoContainsTrack(probeVid, {id: trackId}) && probeVid.readyState >= 2) return probeVid;
 
     const domVid = domVideoElements.get(trackId);
-    if (domVid && domVid.isConnected && domVid.readyState >= 2) return domVid;
+    if (domVid && videoContainsTrack(domVid, {id: trackId}) && domVid.readyState >= 2) return domVid;
 
     return null;
   }
 
   function isLikelyScreenShareVideoElement(vid) {
     if (!vid || !vid.isConnected) return false;
-    const rect = vid.getBoundingClientRect();
+    if ([...videoProbes.values()].includes(vid)) return false;
     const stream = vid.srcObject;
     const track = stream && typeof stream.getVideoTracks === 'function'
       ? stream.getVideoTracks().find(t => t.readyState === 'live')
       : null;
-    const settings = track?.getSettings ? track.getSettings() : {};
-    const label = [
-      track?.label,
-      vid.getAttribute('aria-label'),
-      vid.closest('[aria-label]')?.getAttribute('aria-label'),
-      vid.closest('[data-participant-id]')?.textContent,
-    ].filter(Boolean).join(' ');
-
-    if (/present|presentation|screen|sharing|shared|tab|window/i.test(label)) return true;
-    if (settings.displaySurface && settings.displaySurface !== 'monitor') return true;
-    if (settings.displaySurface) return true;
-    if ((settings.width || 0) >= 960 || (settings.height || 0) >= 540) return true;
-
-    // Defer final judgment until dimensions exist. Meet often initializes with 0x0.
-    return rect.width >= Math.min(window.innerWidth * 0.45, 640) ||
-           rect.height >= Math.min(window.innerHeight * 0.45, 360) ||
-           vid.videoWidth >= 960 ||
-           vid.videoHeight >= 540;
+    if (!track || recordingCanvasStream?.getVideoTracks().some(t => t.id === track.id)) return false;
+    const evidence = getScreenShareEvidence(track, vid);
+    if (!evidence.hint && isLocalCameraPreview(track, vid)) return false;
+    return !!evidence.hint || evidence.highResolution;
   }
 
   function scanDomForScreenShare(force = false) {
@@ -798,33 +901,38 @@
     lastScreenShareDomScan = now;
     if (forceNoScreenShare) return;
 
+    const selected = screenShareTrack;
+    const preserveSelected = selected?.readyState === 'live' &&
+      (screenShareHints.get(selected) || getScreenShareEvidence(selected).hint);
+    const knownShares = new Set(activeScreenShareTracks.map(track => track.id));
     let best = null;
-    let bestArea = 0;
     document.querySelectorAll('video').forEach(vid => {
+      if (!isLikelyScreenShareVideoElement(vid)) return;
       const stream = vid.srcObject;
       if (!stream || typeof stream.getVideoTracks !== 'function') return;
       const track = stream.getVideoTracks().find(t => t.readyState === 'live');
       if (!track) return;
+      const evidence = getScreenShareEvidence(track, vid);
+      const hinted = !!evidence.hint;
+      const newlyExplicit = hinted && !screenShareHints.get(track);
+      // Virtualization must not make an older known share displace the selected
+      // live presentation. A newly discovered explicit source can still win.
+      if (preserveSelected && selected.id !== track.id && knownShares.has(track.id) && !newlyExplicit) {
+        domVideoElements.set(track.id, vid);
+        return;
+      }
 
-      const settings = track.getSettings ? track.getSettings() : {};
-      const label = `${track.label || ''} ${vid.getAttribute('aria-label') || ''} ${vid.closest('[aria-label]')?.getAttribute('aria-label') || ''} ${settings.displaySurface || ''}`.toLowerCase();
-      const hasScreenHint = /present|presentation|screen|sharing|shared|tab|window/.test(label) || !!settings.displaySurface;
-      const videoReady = vid.readyState >= 2 && (vid.videoWidth >= 960 || vid.videoHeight >= 540);
       const rect = vid.getBoundingClientRect();
-      const largeEnough = rect.width >= Math.min(window.innerWidth * 0.45, 640) ||
-        rect.height >= Math.min(window.innerHeight * 0.45, 360);
-
-      if (!hasScreenHint && !videoReady && !largeEnough) return;
-
-      const area = Math.max(rect.width * rect.height, (settings.width || 0) * (settings.height || 0), (vid.videoWidth || 0) * (vid.videoHeight || 0));
-      if (area > bestArea) {
+      const area = evidence.width * evidence.height || rect.width * rect.height;
+      const current = track.id === screenShareTrack?.id;
+      if (!best || (hinted !== best.hinted ? hinted : newlyExplicit !== best.newlyExplicit ? newlyExplicit : current !== best.current ? current : area > best.area)) {
         best = {
           vid,
           track,
-          resolution: `${vid.videoWidth || settings.width || 0}x${vid.videoHeight || settings.height || 0}`,
-          settings,
+          resolution: `${evidence.width}x${evidence.height}`,
+          settings: evidence.settings,
+          hinted, newlyExplicit, current, area,
         };
-        bestArea = area;
       }
     });
 
@@ -832,23 +940,58 @@
     domVideoElements.set(best.track.id, best.vid);
     if (!allVideoTracks.find(t => t.id === best.track.id)) {
       addVideoTrack(best.track);
+    } else {
+      // Meet can reuse a receiver whose camera probe was already retired.
+      // Restore owned playback before its presentation tile is virtualized.
+      probeVideoTrack(best.track);
     }
     confirmScreenShare(best.track, 'dom_scan', {
       resolution: best.resolution,
       displaySurface: best.settings?.displaySurface,
+    }, best.hinted);
+  }
+
+  function refreshScreenShareDetection(force = false) {
+    if (forceNoScreenShare || (!force && Date.now() - lastScreenShareDomScan < 1000)) return;
+    const track = screenShareTrack;
+    if (track?.readyState !== 'live' && track) removeObservedTrack(track.id);
+    else if (track) {
+      const check = videoProbeChecks.get(track.id);
+      if (check) check();
+      else {
+        const evidence = getScreenShareEvidence(track, getVideoElementForScreenShare(track.id));
+        const hinted = evidence.hint || screenShareHints.get(track);
+        if (evidence.camera || (!hinted && isLocalCameraPreview(track))) rejectScreenShare(track, 'camera_metadata');
+        else if (!hinted && evidence.width > 0 && evidence.height > 0 && !evidence.highResolution) rejectScreenShare(track);
+      }
+    }
+    // Receivers can gain presentation metadata without a visible tile or a
+    // resize event. Revalidate owned probes and revive retired ones only when
+    // explicit evidence exists, so camera probes stay retired.
+    allVideoTracks.forEach(candidate => {
+      if (candidate === track || candidate.readyState !== 'live') return;
+      const check = videoProbeChecks.get(candidate.id);
+      if (check) check();
+      else if (getScreenShareEvidence(candidate).hint) probeVideoTrack(candidate);
     });
+    // New explicit shares must be discoverable even while an inferred video is
+    // selected. Validation also observes labels changed after probe timers end.
+    scanDomForScreenShare(true);
   }
 
   function probeVideoTrack(track) {
-    if (videoProbes.has(track.id)) return;
+    if (videoProbes.has(track.id)) {
+      videoProbeChecks.get(track.id)?.();
+      return;
+    }
     
     let timers = [];
     
-    const labelIsScreen = track.label && /screen|window|tab|display|monitor/i.test(track.label);
-    const hintIsScreen = track.contentHint === 'detail' || track.contentHint === 'text';
-    
-    if (labelIsScreen || hintIsScreen) {
-      confirmScreenShare(track, labelIsScreen ? 'label' : 'contentHint');
+    const initialEvidence = getScreenShareEvidence(track);
+    if (initialEvidence.hint || initialEvidence.highResolution) {
+      confirmScreenShare(track, initialEvidence.hint || 'resolution', {
+        resolution: `${initialEvidence.width}x${initialEvidence.height}`,
+      });
     }
     
     const vid = document.createElement('video');
@@ -871,6 +1014,7 @@
       track.removeEventListener('ended', cleanupProbe);
       timers = [];
       if (videoProbes.get(track.id) === vid) videoProbes.delete(track.id);
+      if (videoProbeChecks.get(track.id) === check) videoProbeChecks.delete(track.id);
       if (probeDisposers.get(track.id) === cleanupProbe) probeDisposers.delete(track.id);
     };
     probeDisposers.set(track.id, cleanupProbe);
@@ -878,24 +1022,33 @@
     vid.play().catch(() => {});
 
     const check = () => {
-      if (!vid.isConnected) return;
-      const w = vid.videoWidth, h = vid.videoHeight;
-      if (w > 0 && h > 0) {
-        const labelIsScreen = track.label && /screen|window|tab|display|monitor/i.test(track.label);
-        const hintIsScreen = track.contentHint === 'detail' || track.contentHint === 'text';
-        const resIsScreen = w >= 960 && h >= 540;
-        
-        const isScreen = labelIsScreen || hintIsScreen || resIsScreen;
-        
-        if (isScreen) {
-          confirmScreenShare(track, 'resolution', { resolution: `${w}x${h}` });
+      if (!vid.isConnected || track.readyState !== 'live') return;
+      const evidence = getScreenShareEvidence(track, vid);
+      const { width: w, height: h } = evidence;
+      // Explicit camera/self evidence is sufficient to reject a stale selection
+      // even before frames or settings contain any dimensions.
+      if (evidence.camera || (!evidence.hint && !screenShareHints.get(track) && isLocalCameraPreview(track))) {
+        rejectScreenShare(track, 'camera_metadata');
+        cleanupProbe();
+        return;
+      }
+      const hint = evidence.hint || (!evidence.camera && screenShareHints.get(track) ? 'remembered_hint' : null);
+      if (hint || (w > 0 && h > 0)) {
+        if (hint || evidence.highResolution) {
+          const confirmed = confirmScreenShare(track, hint || 'resolution', { resolution: `${w}x${h}` }, !!hint);
+          if (!confirmed && !evidence.hint) {
+            if (!forceNoScreenShare) rejectScreenShare(track, 'candidate_rejected');
+            cleanupProbe();
+          }
         } else {
+          rejectScreenShare(track);
           console.log(`[MeetRecorder] Track ${track.id} (${w}x${h}) identified as camera. Destroying probe element.`);
           cleanupProbe();
         }
       }
     };
 
+    videoProbeChecks.set(track.id, check);
     vid.addEventListener('loadedmetadata', check);
     vid.addEventListener('resize', check);
     
@@ -954,7 +1107,7 @@
       }
     });
 
-    scanDomForScreenShare(true);
+    refreshScreenShareDetection(true);
     postOut('INFO', `Media rescan complete: +${addedAudio} audio, +${addedVideo} video`);
   }
 
@@ -1065,8 +1218,9 @@
       "setting", "close", "minimize", "more", "menu", "participant", "people",
       "chat", "activity", "info", "help", "report", "feedback", "layout", "change"
     ];
+    const words = clean.split(/[\s.,:!?()]+/);
     for (const kw of blacklistKeywords) {
-      if (clean.includes(kw)) return false;
+      if (words.includes(kw)) return false;
     }
     
     // Blacklist patterns that indicate system text
@@ -1149,7 +1303,8 @@
 
   // ─── Tile-based participant scraping ──────────────────────────────────────
   // Verified against current (June 2026) Meet DOM via __meetRecDumpDOM:
-  //   • [data-participant-id] tiles exist for every participant in the call
+  //   • [data-participant-id] tiles identify only the currently rendered participants
+  //     (Meet virtualizes the rest; tile count is NOT meeting membership)
   //   • Local tile has self-only UI strings: "You're continuously framed",
   //     "Backgrounds and effects", and material icon ligature "frame_person"
   //   • Name lives in the "More options for <Name>" button aria-label, with
@@ -1186,9 +1341,10 @@
       // De-duplicate "Satyajit PandaSatyajit Panda" → "Satyajit Panda"
       const half = Math.floor(part.length / 2);
       if (half > 0 && part.slice(0, half) === part.slice(half)) {
-        return part.slice(0, half).trim();
+        const name = part.slice(0, half).trim();
+        if (isRealParticipantName(name) || name.toLowerCase() === 'you') return name;
       }
-      if (part.length > 1 && part.length < 60) return part;
+      if (isRealParticipantName(part) || part.toLowerCase() === 'you') return part;
     }
     return '';
   }
@@ -1212,8 +1368,7 @@
   function getMeetTiles() {
     const out = [];
     document.querySelectorAll('[data-participant-id]').forEach(tile => {
-      const text = tile.textContent || '';
-      const isSelf = SELF_MARKER_RE.test(text);
+      if (tile.querySelector('[data-participant-id]')) return;
       const name = extractNameFromTile(tile);
       const avatarUrl = extractAvatarFromTile(tile);
       if (!name && !avatarUrl) return;
@@ -1221,27 +1376,25 @@
         participantId: tile.getAttribute('data-participant-id'),
         name,
         avatarUrl,
-        isSelf,
+        isSelf: isSelfTile(tile),
       });
     });
     return out;
   }
 
-  function getRemoteTiles() {
-    return getMeetTiles().filter(t => !t.isSelf && t.name);
+  function isSelfTile(tile) {
+    return SELF_MARKER_RE.test(tile.textContent || '') || tile.hasAttribute('data-self-name') ||
+      !!tile.querySelector('[data-self-name]') || extractNameFromTile(tile).toLowerCase() === 'you';
   }
 
-  function getLocalUserInfo() {
-    if (cachedLocalUserInfo && cachedLocalUserInfo.name !== 'You' && cachedLocalUserInfo.avatarUrl) {
-      return cachedLocalUserInfo;
-    }
+  function getLocalUserInfo(refresh = false, tiles = null) {
+    if (cachedLocalUserInfo && !refresh) return cachedLocalUserInfo;
 
     let name = 'You';
     let avatarUrl = null;
 
     // PRIMARY: find the self tile via marker text in [data-participant-id]
-    const tiles = getMeetTiles();
-    const selfTile = tiles.find(t => t.isSelf);
+    const selfTile = (tiles || getMeetTiles()).find(t => t.isSelf);
     if (selfTile) {
       if (selfTile.name) name = selfTile.name;
       if (selfTile.avatarUrl) avatarUrl = selfTile.avatarUrl;
@@ -1255,7 +1408,7 @@
         const extractedName = extractNameFromLabel(label);
         if (extractedName && name === 'You') name = extractedName;
         const img = accountBtn.querySelector('img');
-        if (img && !avatarUrl) avatarUrl = img.src;
+        if (img && !avatarUrl) avatarUrl = img.src.replace(/=s\d+/, '=s200');
       }
     }
 
@@ -1264,19 +1417,32 @@
       if (realName) name = realName;
     }
 
-    cachedLocalUserInfo = { name, avatarUrl };
+    // Keep proven self metadata when the self tile is temporarily virtualized.
+    const previousName = cachedLocalUserInfo?.name;
+    cachedLocalUserInfo = {
+      name: name === 'You' ? (cachedLocalUserInfo?.name || name) : name,
+      avatarUrl: avatarUrl || cachedLocalUserInfo?.avatarUrl || null,
+      participantId: selfTile?.participantId || cachedLocalUserInfo?.participantId || null,
+    };
+    if (previousName !== cachedLocalUserInfo.name) participantRoutingDirty = true;
     return cachedLocalUserInfo;
   }
 
   function findNameAndAvatarFromElement(el) {
     // Only extract name/avatar if the element is a video, ensuring we start within a participant tile
     if (!el || el.tagName !== 'VIDEO') return null;
+
+    const tile = el.closest('[data-participant-id]');
+    if (tile) return extractNameAndAvatarFromTile(tile);
     
     let parent = el.parentElement;
     let depth = 0;
     // Restrict depth < 4 to prevent leakage out of the participant's specific tile container
     // and explicitly block traversing up to global document levels
     while (parent && parent !== document.body && parent !== document.documentElement && depth < 4) {
+      // An ancestor containing another participant/media element is not evidence
+      // for this video. Never borrow a sibling's identity from a grid wrapper.
+      if (parent.querySelector('[data-participant-id]') || parent.querySelectorAll('video, audio').length > 1) break;
       const img = parent.querySelector('img[src*="googleusercontent"]');
       const fallbackImg = parent.querySelector('img');
       const avatarUrl = img ? img.src : (fallbackImg ? fallbackImg.src : null);
@@ -1322,178 +1488,258 @@
     return null;
   }
 
-  // Proactive participant tile cache — scanned on interval so speaker names are always ready
-  const participantTileCache = new Map(); // streamId → { name, avatarUrl }
+  // Bounded page metadata survives tile virtualization; media bindings are
+  // refreshed while recording, independently of speech and presentation layout.
+  const participantTileCache = new Map();
+  const participantMetadata = new Map(); // participantId -> last observed identity
   const PARTICIPANT_TILE_CACHE_MAX = 120;
   let lastTileScanTime = 0;
 
   function pruneParticipantTileCache() {
-    while (participantTileCache.size > PARTICIPANT_TILE_CACHE_MAX) {
-      const oldestKey = participantTileCache.keys().next().value;
-      participantTileCache.delete(oldestKey);
+    for (const cache of [participantTileCache, participantMetadata]) {
+      while (cache.size > PARTICIPANT_TILE_CACHE_MAX) cache.delete(cache.keys().next().value);
     }
+  }
+
+  function rememberParticipant(info) {
+    if (!info) return null;
+    const previous = info.participantId ? participantMetadata.get(info.participantId) : null;
+    // Missing metadata during a rerender does not erase an observed avatar.
+    // A changed name may indicate reuse of a tile ID; don't keep the old avatar.
+    const samePerson = !previous?.name || !info.name || previous.name === info.name;
+    const identity = {
+      ...info, name: info.name || previous?.name || '',
+      avatarUrl: info.avatarUrl || (samePerson ? previous?.avatarUrl : null) || null,
+    };
+    if (identity.participantId) {
+      participantMetadata.delete(identity.participantId);
+      participantMetadata.set(identity.participantId, identity);
+    }
+    if (identity.avatarUrl) getAvatarImage(identity.avatarUrl, true);
+    pruneParticipantTileCache();
+    return identity;
   }
 
   function resolveParticipantFromVideoElement(vid, trackId = null) {
-    if (!vid || vid.tagName !== 'VIDEO') return null;
-
-    const stream = vid.srcObject;
-    if (!stream) return null;
-
-    const extracted = findNameAndAvatarFromElement(vid);
-    if (extracted && extracted.name && extracted.name !== 'Participant') {
-      participantTileCache.set(stream.id, extracted);
-      if (trackId) participantTileCache.set(`track:${trackId}`, extracted);
-      return extracted;
+    if (!vid || !['VIDEO', 'AUDIO'].includes(vid.tagName) || !vid.srcObject) return null;
+    const tile = vid.closest('[data-participant-id]');
+    let info;
+    if (tile) {
+      if (typeof tile.querySelectorAll !== 'function') return null;
+      if (tile.querySelector('[data-participant-id]')) return null;
+      info = {
+        participantId: tile.getAttribute('data-participant-id'),
+        name: extractNameFromTile(tile), avatarUrl: extractAvatarFromTile(tile),
+        isSelf: isSelfTile(tile),
+      };
+    } else {
+      info = findNameAndAvatarFromElement(vid);
     }
-
-    const tile = vid.closest('[data-participant-id]') || vid.parentElement;
-    if (!tile) return null;
-
-    const nameCandidates = [];
-    const ariaLabel = tile.getAttribute('aria-label') || tile.getAttribute('title') || '';
-    if (ariaLabel) nameCandidates.push(ariaLabel);
-
-    const selfNameEl = tile.querySelector('[data-self-name]');
-    if (selfNameEl) {
-      nameCandidates.push(selfNameEl.getAttribute('data-self-name') || selfNameEl.textContent || '');
-    }
-
-    const textNodes = Array.from(tile.querySelectorAll('div, span'))
-      .map(el => (el.childNodes.length === 1 && el.childNodes[0].nodeType === Node.TEXT_NODE) ? el.textContent : '')
-      .filter(Boolean);
-    nameCandidates.push(...textNodes);
-
-    let name = '';
-    for (const candidate of nameCandidates) {
-      const clean = cleanLabelText(candidate);
-      if (isRealParticipantName(clean) || clean.toLowerCase() === 'you') {
-        name = clean;
-        break;
-      }
-    }
-
-    if (name && name.toLowerCase() === 'you') {
-      name = getLocalUserInfo().name || 'You';
-    }
-
-    const img = tile.querySelector('img[src*="googleusercontent"], img');
-    const avatarUrl = img ? img.src : null;
-
-    if (name || avatarUrl) {
-      const resolved = { name: name || 'Participant', avatarUrl };
-      participantTileCache.set(stream.id, resolved);
-      if (trackId) participantTileCache.set(`track:${trackId}`, resolved);
-      return resolved;
-    }
-
-    return null;
+    const identity = rememberParticipant(info);
+    if (!identity?.name || identity.name === 'Participant') return null;
+    const resolved = { ...identity, source: 'direct' };
+    if (vid.srcObject.id) participantTileCache.set(vid.srcObject.id, resolved);
+    if (trackId && !isLocalIdentity(resolved)) participantTileCache.set(`track:${trackId}`, resolved);
+    pruneParticipantTileCache();
+    return resolved;
   }
 
-  function scanParticipantTiles() {
-    const now = Date.now();
-    if (now - lastTileScanTime < 2000) return; // only scan every 2 seconds
-    lastTileScanTime = now;
-    
-    const videos = document.querySelectorAll('video');
-    for (const vid of videos) {
-      const stream = vid.srcObject;
-      if (!stream) continue;
-      if (participantTileCache.has(stream.id)) continue; // already resolved
-      
-      const result = resolveParticipantFromVideoElement(vid);
-      if (result && result.name && result.name !== 'Participant') {
-        participantTileCache.set(stream.id, result);
-        // Cache by audio track stream IDs so remote speaker resolution works —
-        // but ONLY if the resolution isn't the local user. Remote audio tracks
-        // never identify as the local user; caching it would poison resolution.
-        if (!isLocalIdentity(result)) {
-          try {
-            const aTracks = stream.getAudioTracks();
-            if (aTracks && aTracks[0]) {
-              participantTileCache.set(`track:${aTracks[0].id}`, result);
-            }
-          } catch(_) {}
-        }
-      }
+  function setTrackParticipant(trackId, info) {
+    const previous = audioTrackToParticipant.get(trackId);
+    if (previous?.name !== info?.name) participantRoutingDirty = true;
+    if (previous?.name !== info?.name || previous?.participantId !== info?.participantId || previous?.source !== info?.source) {
+      activeSpeakers.delete(`track:${trackId}`);
+      trackCorrelation.delete(trackId);
+    }
+    if (info && !isLocalIdentity(info)) {
+      audioTrackToParticipant.set(trackId, info);
+      participantTileCache.set(`track:${trackId}`, info);
+    } else {
+      audioTrackToParticipant.delete(trackId);
+      participantTileCache.delete(`track:${trackId}`);
     }
     pruneParticipantTileCache();
   }
 
-  // Returns true if a resolved {name, avatarUrl} actually identifies the LOCAL user.
-  // All entries in audioSources are remote (they come from RTCPeerConnection.ontrack,
-  // which only fires for incoming tracks), so any "local" match is by definition a
-  // DOM-walk misattribution and must be rejected.
+  function scanParticipantTiles(force = false) {
+    const now = Date.now();
+    if (!force && now - lastTileScanTime < 1000) return;
+    lastTileScanTime = now;
+    const tiles = getMeetTiles();
+    tiles.forEach(rememberParticipant);
+    localParticipantCached = getLocalUserInfo(true, tiles);
+    if (localParticipantCached.avatarUrl) getAvatarImage(localParticipantCached.avatarUrl, true);
+
+    // Record *all* visible bindings, including missing metadata and conflicts.
+    // A reused stream must invalidate an old identity before a new label arrives.
+    const observed = new Map();
+    function observe(key, info) {
+      if (!key) return;
+      if (observed.has(key)) {
+        const prior = observed.get(key);
+        if (!prior || !info || prior.participantId !== info.participantId || prior.name !== info.name) info = null;
+      }
+      observed.set(key, info);
+    }
+    const ownedMedia = new Set([...trackSinkEls.values(), ...videoProbes.values()]);
+    for (const vid of document.querySelectorAll('video, audio')) {
+      if (ownedMedia.has(vid)) continue;
+      const stream = vid.srcObject;
+      if (!stream) continue;
+      const info = resolveParticipantFromVideoElement(vid);
+      // Meet's unlabelled playback elements are not participant tiles. They
+      // provide no conflicting identity evidence against a labelled video.
+      if (!info && !vid.closest('[data-participant-id]')) continue;
+      observe(stream.id, info);
+      try { for (const track of stream.getTracks()) observe(`track:${track.id}`, info); } catch (_) {}
+    }
+    observed.forEach((info, key) => {
+      if (info && !isLocalIdentity(info)) participantTileCache.set(key, info);
+      else participantTileCache.delete(key);
+    });
+
+    localAudioBindings.clear();
+    audioSources.forEach((_, trackId) => {
+      const key = `track:${trackId}`;
+      const streamId = trackStreamMap.get(trackId);
+      const previous = audioTrackToParticipant.get(trackId);
+      let info;
+      if (observed.has(key)) info = observed.get(key);
+      else if (observed.has(streamId)) info = observed.get(streamId);
+      else {
+        info = participantTileCache.get(key) || participantTileCache.get(streamId) || previous;
+        if (info?.source === 'direct') info = { ...info, source: 'cached' };
+      }
+      if (info?.participantId && participantMetadata.has(info.participantId)) {
+        info = { ...info, ...participantMetadata.get(info.participantId) };
+      }
+      if (info && isLocalIdentity(info)) { localAudioBindings.add(trackId); info = null; }
+      setTrackParticipant(trackId, info);
+      if (info?.avatarUrl) getAvatarImage(info.avatarUrl, true);
+    });
+    pruneParticipantTileCache();
+    // Named/VIP outputs also need the newly discovered or reassigned identity.
+    if (participantRoutingDirty && isRecording) rebuildAudioGraph();
+  }
+
+  // Remote identity must never be borrowed from self UI, including different
+  // resolutions of the same Google avatar.
   function isLocalIdentity(info) {
     if (!info) return false;
-    if (info.name && info.name.toLowerCase() === 'you') return true;
+    if (info.isSelf || info.name?.toLowerCase() === 'you') return true;
     const localInfo = getLocalUserInfo();
-    if (!localInfo) return false;
+    // Proven, distinct tile IDs outrank coincidentally identical names/photos.
+    if (info.participantId && localInfo.participantId) return info.participantId === localInfo.participantId;
     if (localInfo.name && info.name && localInfo.name.toLowerCase() === info.name.toLowerCase()) return true;
-    if (localInfo.avatarUrl && info.avatarUrl && localInfo.avatarUrl === info.avatarUrl) return true;
-    return false;
+    const canonicalAvatar = url => url?.replace(/=s\d+/, '=s200');
+    return !!localInfo.avatarUrl && !!info.avatarUrl &&
+      canonicalAvatar(localInfo.avatarUrl) === canonicalAvatar(info.avatarUrl);
   }
 
   function getParticipantForTrack(trackId) {
-    // ZEROTH: tile-based resolution. With current Meet DOM (no <video> when
-    // cameras are off, no [data-self-name]), this is the only reliable signal.
-    // If there's exactly one remote participant tile, all remote audio is
-    // attributable to them with 100% confidence.
-    const remoteTiles = getRemoteTiles();
-    if (remoteTiles.length === 1) {
-      return { name: remoteTiles[0].name, avatarUrl: remoteTiles[0].avatarUrl };
-    }
-
-    // First: check proactive tile cache by track ID key
-    const cachedByTrack = participantTileCache.get(`track:${trackId}`);
-    if (cachedByTrack && !isLocalIdentity(cachedByTrack)) return cachedByTrack;
-    // Cache poisoned with local identity from an earlier walk — evict so we can try again.
-    if (cachedByTrack && isLocalIdentity(cachedByTrack)) {
-      participantTileCache.delete(`track:${trackId}`);
-    }
-
     const targetStreamId = trackStreamMap.get(trackId);
-    if (!targetStreamId) return null;
-
-    // Second: check proactive tile cache by stream ID
-    const cachedByStream = participantTileCache.get(targetStreamId);
-    if (cachedByStream && !isLocalIdentity(cachedByStream)) return cachedByStream;
-    if (cachedByStream && isLocalIdentity(cachedByStream)) {
-      participantTileCache.delete(targetStreamId);
-    }
-
-    // Third: direct match against visible video elements whose attached media includes this track.
-    const videos = document.querySelectorAll('video');
-    for (const vid of videos) {
+    // Live binding outranks caches so DOM node / stream reuse is observed.
+    let observed = false, observedLocal = false, resolved = null;
+    const matchedStreams = new Set();
+    const ownedMedia = new Set([...trackSinkEls.values(), ...videoProbes.values()]);
+    for (const vid of document.querySelectorAll('video, audio')) {
+      if (ownedMedia.has(vid)) continue;
       const stream = vid.srcObject;
       if (!stream) continue;
-
-      try {
-        const tracks = typeof stream.getTracks === 'function' ? stream.getTracks() : [];
-        const hasTrack = tracks.some(t => t.id === trackId);
-        if (hasTrack) {
-          const p = resolveParticipantFromVideoElement(vid, trackId);
-          if (p && p.name !== 'Participant' && !isLocalIdentity(p)) return p;
-        }
-      } catch (_) {}
-    }
-
-    // Fourth: live DOM lookup by known stream id
-    for (const vid of videos) {
-      const stream = vid.srcObject;
-      if (!stream) continue;
-
-      if (stream.id === targetStreamId) {
-        const p = resolveParticipantFromVideoElement(vid, trackId);
-        if (p && p.name !== 'Participant' && !isLocalIdentity(p)) {
-          participantTileCache.set(stream.id, p);
-          participantTileCache.set(`track:${trackId}`, p);
-          return p;
-        }
+      let hasTrack = false;
+      try { hasTrack = stream.getTracks().some(t => t.id === trackId); } catch (_) {}
+      if (!hasTrack && (!targetStreamId || stream.id !== targetStreamId)) continue;
+      const info = resolveParticipantFromVideoElement(vid);
+      if (!info && !vid.closest('[data-participant-id]')) continue;
+      if (info && isLocalIdentity(info)) observedLocal = true;
+      matchedStreams.add(stream.id);
+      if (observed && (!resolved || !info || resolved.participantId !== info.participantId || resolved.name !== info.name)) {
+        matchedStreams.forEach(id => participantTileCache.delete(id));
+        if (targetStreamId) participantTileCache.delete(targetStreamId);
+        setTrackParticipant(trackId, null);
+        return null;
       }
+      observed = true;
+      resolved = info && !isLocalIdentity(info) ? info : null;
     }
+    if (observed) {
+      if (!resolved) matchedStreams.forEach(id => participantTileCache.delete(id));
+      if (observedLocal) localAudioBindings.add(trackId);
+      else localAudioBindings.delete(trackId);
+      setTrackParticipant(trackId, resolved);
+      return resolved;
+    }
+    const cached = participantTileCache.get(`track:${trackId}`) ||
+      participantTileCache.get(targetStreamId) || audioTrackToParticipant.get(trackId);
+    return cached && !isLocalIdentity(cached) ? cached : null;
+  }
 
-    return null;
+  function stopParticipantIdentityRefresh(session) {
+    clearTimeout(session.identityTimer);
+    clearTimeout(session.identityWarmupTimer);
+    session.identityTimer = session.identityWarmupTimer = null;
+    session.identityWarmupFinish?.();
+    session.identityWarmupFinish = null;
+  }
+
+  async function warmParticipantIdentities(session) {
+    scanParticipantTiles(true);
+    const pending = [...avatarImageCache.values()].filter(img => !img.complete && img.__meetRecReady);
+    if (!pending.length) return;
+    // Give already-visible avatars a short head start before capture, with a
+    // bounded wait for unavailable/cross-origin images and cancellable START.
+    await new Promise(resolve => {
+      session.identityWarmupFinish = resolve;
+      session.identityWarmupTimer = setTimeout(resolve, 750);
+      Promise.all(pending.map(img => img.__meetRecReady)).then(resolve);
+    });
+    clearTimeout(session.identityWarmupTimer);
+    session.identityWarmupTimer = null;
+    session.identityWarmupFinish = null;
+  }
+
+  function startParticipantIdentityRefresh(session) {
+    const tick = () => {
+      session.identityTimer = null;
+      if (activeRecordingSession !== session || session.state !== 'recording') return;
+      try {
+        scanParticipantTiles(true);
+        refreshScreenShareDetection();
+        updateSpeakerCorrelation();
+      } catch (err) {
+        console.error('[MeetRecorder] Participant identity refresh failed:', err);
+      }
+      session.identityTimer = setTimeout(tick, 1000);
+    };
+    session.identityTimer = setTimeout(tick, 1000);
+  }
+
+  function clearParticipantIdentities(releaseImages = true) {
+    // Identity strings belong to live incoming tracks, not a recording session.
+    // Keep proven bindings across Stop/Start and virtualization; retire them in
+    // forgetTrack. Session-owned images, speaker history and timers are released.
+    const liveBindings = new Map();
+    audioSources.forEach((_, trackId) => {
+      const info = audioTrackToParticipant.get(trackId) || participantTileCache.get(`track:${trackId}`) ||
+        participantTileCache.get(trackStreamMap.get(trackId));
+      if (info && !isLocalIdentity(info)) liveBindings.set(trackId, info);
+    });
+    activeSpeakers.clear();
+    audioTrackToParticipant.clear();
+    participantTileCache.clear();
+    liveBindings.forEach((info, trackId) => {
+      audioTrackToParticipant.set(trackId, info);
+      participantTileCache.set(`track:${trackId}`, info);
+    });
+    pruneParticipantTileCache();
+    trackCorrelation.clear();
+    lastResolveTime.clear();
+    localParticipantCached = null;
+    lastTileScanTime = lastLocalResolveTime = lastCorrelationTime = 0;
+    if (releaseImages) {
+      avatarImageCache.forEach(disposeAvatarImage);
+      avatarImageCache.clear();
+    }
   }
 
   // Helper: check if a computed style color string matches active speaker highlights (blue or green)
@@ -1546,6 +1792,13 @@
   // Helper: extract name and avatar from a participant tile container
   function extractNameAndAvatarFromTile(tileEl) {
     if (!tileEl) return null;
+    if (tileEl.hasAttribute('data-participant-id')) {
+      const name = extractNameFromTile(tileEl);
+      return name ? {
+        name, avatarUrl: extractAvatarFromTile(tileEl),
+        participantId: tileEl.getAttribute('data-participant-id'), isSelf: isSelfTile(tileEl),
+      } : null;
+    }
     
     const img = tileEl.querySelector('img[src*="googleusercontent"]');
     const avatarUrl = img ? img.src : null;
@@ -1594,16 +1847,15 @@
     const tiles = allTiles.filter(tile => !tile.querySelector('[data-participant-id]'));
     
     const localInfo = getLocalUserInfo();
-    const selfName = localInfo.name.toLowerCase();
     
     for (const tile of tiles) {
       // Exclude local self-preview tile to prevent remote audio tracks from correlating to the local user
-      if (tile.querySelector('[data-self-name]') || tile.hasAttribute('data-self-name')) {
+      if (isSelfTile(tile)) {
         continue;
       }
       
       // Exclude if tile text literally says "You"
-      if (/\\bYou\\b/i.test(tile.textContent || '')) {
+      if (/\bYou\b/i.test(tile.textContent || '')) {
         continue;
       }
       
@@ -1629,11 +1881,11 @@
         if (info && info.name && info.name !== 'Participant') {
           const nameLower = info.name.toLowerCase();
           // Skip if matched name is local user
-          if (nameLower === 'you' || nameLower === selfName) {
+          if (nameLower === 'you') {
             continue;
           }
           // Strictly skip if avatar exact-matches local avatar (prevents cross-correlation)
-          if (localInfo.avatarUrl && info.avatarUrl && localInfo.avatarUrl === info.avatarUrl) {
+          if (isLocalIdentity(info)) {
             continue;
           }
           speakers.push(info);
@@ -1646,25 +1898,53 @@
   // ─── Drawing Utilities ────────────────────────────────────────────────────
   const avatarImageCache = new Map();
   const AVATAR_CACHE_MAX = 50;
-  function getAvatarImage(url) {
+  const AVATAR_RETRY_DELAY_MS = 5000;
+  const AVATAR_LOAD_TIMEOUT_MS = 10000;
+  function disposeAvatarImage(img) {
+    img.__meetRecFinish?.();
+    img.__meetRecFinish = null;
+    img.onload = img.onerror = null;
+    img.src = '';
+  }
+
+  function getAvatarImage(url, prefetch = false) {
     if (!url) return null;
     if (avatarImageCache.has(url)) {
       const cached = avatarImageCache.get(url);
       // Refresh LRU recency.
       avatarImageCache.delete(url);
       avatarImageCache.set(url, cached);
-      return cached.complete ? cached : null;
+      if (cached.complete && cached.naturalWidth > 0) return cached;
+      const retryAt = cached.complete ? cached.__meetRecRetryAt : cached.__meetRecStartedAt + AVATAR_LOAD_TIMEOUT_MS;
+      if (Date.now() < retryAt) return null;
+      // Retry transient failures and stalled requests on the existing refresh
+      // loop. Detach the previous image so late callbacks cannot affect a retry.
+      disposeAvatarImage(cached);
+      avatarImageCache.delete(url);
     }
+    // Passive preloading must not evict the same loaded photos every scan in
+    // large meetings. Actual speaker drawing can replace an LRU entry on demand.
+    if (prefetch && avatarImageCache.size >= AVATAR_CACHE_MAX) return null;
     const img = new Image();
     img.crossOrigin = 'anonymous';
+    img.__meetRecStartedAt = Date.now();
+    img.__meetRecRetryAt = img.__meetRecStartedAt + AVATAR_RETRY_DELAY_MS;
+    img.__meetRecReady = new Promise(resolve => { img.__meetRecFinish = resolve; });
+    img.onload = img.onerror = () => {
+      if (!img.naturalWidth) img.__meetRecRetryAt = Date.now() + AVATAR_RETRY_DELAY_MS;
+      img.__meetRecFinish?.();
+      img.__meetRecFinish = null;
+      img.onload = img.onerror = null;
+    };
     img.src = url;
     avatarImageCache.set(url, img);
     // Evict oldest entries once over the cap (Map preserves insertion order).
     while (avatarImageCache.size > AVATAR_CACHE_MAX) {
       const oldestKey = avatarImageCache.keys().next().value;
+      disposeAvatarImage(avatarImageCache.get(oldestKey));
       avatarImageCache.delete(oldestKey);
     }
-    return null;
+    return img.complete && img.naturalWidth > 0 ? img : null;
   }
 
   function drawWrappedText(ctx, text, x, y, maxWidth, lineHeight) {
@@ -1825,8 +2105,55 @@
   const trackCorrelation = new Map(); // trackId -> Map(name -> score)
   let lastCorrelationTime = 0;
 
+  function updateSpeakerCorrelation() {
+    const now = Date.now();
+    // Correlation must keep running while speaker cards are hidden or paused.
+    if (now - lastCorrelationTime > 500) {
+      lastCorrelationTime = now;
+      try {
+        // Direct media bindings outrank correlation. Continue checking correlated
+        // tracks, since Meet can reuse a receiver for another camera-off speaker.
+        const activeTracks = [];
+        let audibleTracks = 0;
+        audioSources.forEach((srcNode, trackId) => {
+          const level = audioLevels.get(trackId) || 0;
+          if (level > 0.015) audibleTracks++;
+          const info = audioTrackToParticipant.get(trackId);
+          if (level > 0.015 && !localAudioBindings.has(trackId) && (!info || info.source !== 'direct')) {
+            activeTracks.push(trackId);
+          }
+        });
+
+        const domSpeakers = activeTracks.length > 0 ? scanActiveSpeakersFromDOM() : [];
+
+        // Overlapping speech/highlights cannot tell which track belongs to which
+        // tile. Require repeated one-track/one-tile observations before binding.
+        if (audibleTracks === 1 && activeTracks.length === 1 && domSpeakers.length === 1 && localMicVolume <= 0.015) {
+          const trackId = activeTracks[0], speaker = domSpeakers[0];
+          const scores = trackCorrelation.get(trackId) || new Map();
+          trackCorrelation.set(trackId, scores);
+          const identityKey = speaker.participantId || speaker.name;
+          const nextScore = (scores.get(identityKey) || 0) + 1;
+          scores.clear();
+          scores.set(identityKey, nextScore);
+          if (nextScore >= 3) {
+            const resolvedData = { ...rememberParticipant(speaker), source: 'correlation' };
+            setTrackParticipant(trackId, resolvedData);
+            if (participantRoutingDirty) rebuildAudioGraph();
+          }
+        } else {
+          trackCorrelation.clear();
+        }
+      } catch (err) {
+        console.error('[MeetRecorder] Correlation logic error:', err);
+      }
+    }
+
+  }
+
   function renderSpeakersOverlay(ctx) {
     const now = Date.now();
+    scanParticipantTiles();
     
     // 1. Process local mic volume (cached & throttled to avoid layout thrashing)
     if (localMicVolume > 0.015) {
@@ -1835,7 +2162,7 @@
         localParticipantCached = getLocalUserInfo();
       }
       
-      activeSpeakers.set(localParticipantCached.name, {
+      activeSpeakers.set('local', {
         name: localParticipantCached.name,
         avatarUrl: localParticipantCached.avatarUrl,
         lastSpokenTime: now
@@ -1862,13 +2189,13 @@
             lastResolveTime.set(trackId, now);
             const pInfo = getParticipantForTrack(trackId);
             if (pInfo && pInfo.name && pInfo.name !== 'Participant') {
-              resolved = { name: pInfo.name, avatarUrl: pInfo.avatarUrl };
-              audioTrackToParticipant.set(trackId, resolved);
+              resolved = pInfo;
+              setTrackParticipant(trackId, resolved);
             }
           }
           if (!resolved) {
             const cachedByTrack = participantTileCache.get(`track:${trackId}`);
-            if (cachedByTrack) {
+            if (cachedByTrack && !isLocalIdentity(cachedByTrack)) {
               resolved = cachedByTrack;
               audioTrackToParticipant.set(trackId, resolved);
             }
@@ -1879,84 +2206,33 @@
         // been resolved yet. Otherwise the user sees nothing for remote speakers
         // whose video tile isn't currently rendered (camera off, off-screen, etc).
         // Use the trackId as a stable key so the card stays put while we resolve.
-        const speakerKey = resolved ? resolved.name : `track:${trackId}`;
+        const speakerKey = `track:${trackId}`;
         const displayName = resolved ? resolved.name : 'Speaker';
         const avatarUrl = resolved ? resolved.avatarUrl : null;
-        
-        // Clean up the unresolved placeholder key once resolution succeeds to prevent duplicate cards
-        if (resolved) {
-          activeSpeakers.delete(`track:${trackId}`);
-        }
         
         activeSpeakers.set(speakerKey, {
           name: displayName,
           avatarUrl,
+          participantId: resolved?.participantId || null,
           lastSpokenTime: now,
         });
       }
     });
     
-    // 2b. Also run a proactive tile scan (throttled to every 2s) so cache is always warm
-    scanParticipantTiles();
+    updateSpeakerCorrelation();
 
-    // 2c. Run correlation-based resolution (throttled to every 500ms) for camera-off speakers
-    if (now - lastCorrelationTime > 500) {
-      lastCorrelationTime = now;
-      try {
-        // Only the unresolved active tracks need correlation. Compute these FIRST
-        // and skip the expensive DOM/getComputedStyle scan entirely when none remain
-        // — in a settled meeting every track is already resolved, so this is a no-op.
-        const activeTracks = [];
-        audioSources.forEach((srcNode, trackId) => {
-          const level = audioLevels.get(trackId) || 0;
-          if (level > 0.015 && !audioTrackToParticipant.has(trackId)) {
-            activeTracks.push(trackId);
-          }
-        });
-
-        const domSpeakers = activeTracks.length > 0 ? scanActiveSpeakersFromDOM() : [];
-
-        if (activeTracks.length > 0 && domSpeakers.length > 0) {
-          activeTracks.forEach(trackId => {
-            let scores = trackCorrelation.get(trackId);
-            if (!scores) {
-              scores = new Map();
-              trackCorrelation.set(trackId, scores);
-            }
-            
-            domSpeakers.forEach(speaker => {
-              const currentScore = scores.get(speaker.name) || 0;
-              const nextScore = currentScore + 1;
-              scores.set(speaker.name, nextScore);
-              
-              if (nextScore >= 3) {
-                let isHighest = true;
-                scores.forEach((s, name) => {
-                  if (name !== speaker.name && s >= nextScore) {
-                    isHighest = false;
-                  }
-                });
-                
-                if (isHighest) {
-                  const resolvedData = { name: speaker.name, avatarUrl: speaker.avatarUrl };
-                  audioTrackToParticipant.set(trackId, resolvedData);
-                  participantTileCache.set(`track:${trackId}`, resolvedData);
-                  console.log(`[MeetRecorder] Correlation resolved track ${trackId} to camera-off participant: ${speaker.name}`);
-                }
-              }
-            });
-          });
-        }
-      } catch (err) {
-        console.error('[MeetRecorder] Correlation logic error:', err);
-      }
-    }
-    
     // 3. Filter speakers within 1s decay window
     const speakersToShow = [];
+    const shownIdentities = new Set();
     activeSpeakers.forEach((speaker, name) => {
       if (now - speaker.lastSpokenTime < 1000) {
-        speakersToShow.push(speaker);
+        // Several live tracks may belong to one participant. Keep per-track
+        // ownership/retirement, while rendering one card for a known identity.
+        const identity = speaker.participantId || (speaker.name === 'Speaker' ? name : speaker.name);
+        if (!shownIdentities.has(identity)) {
+          shownIdentities.add(identity);
+          speakersToShow.push(speaker);
+        }
       } else {
         activeSpeakers.delete(name);
       }
@@ -2053,9 +2329,7 @@
 
     try {
       let showingScreen = false;
-      if (!forceNoScreenShare && (!screenShareTrack || screenShareTrack.readyState !== 'live')) {
-        scanDomForScreenShare();
-      }
+      refreshScreenShareDetection();
       if (!forceNoScreenShare && screenShareTrack && screenShareTrack.readyState === 'live') {
         const probeVid = getVideoElementForScreenShare(screenShareTrack.id);
         if (probeVid) {
@@ -2235,6 +2509,7 @@
   function cleanupRecordingResources(session = activeRecordingSession) {
     if (!session || session.disposed) return;
     session.disposed = true;
+    stopParticipantIdentityRefresh(session);
     clearTimeout(session.activityTimer);
     session.activityTimer = null;
     session.recorders.forEach(entry => {
@@ -2265,6 +2540,7 @@
       } catch (err) {
         postOut('WARN', `Next recording audio graph setup failed: ${err.message}`);
       }
+      clearParticipantIdentities();
     }
   }
 
@@ -2341,6 +2617,7 @@
     if (session.finalization) return session.finalization;
     session.state = 'finalizing';
     session.stoppedAt = Date.now();
+    stopParticipantIdentityRefresh(session);
     clearTimeout(session.activityTimer);
     session.activityTimer = null;
     if (activeRecordingSession === session) {
@@ -2403,6 +2680,9 @@
     activeRecordingSession = session;
     currentRecordId = session.id;
     try {
+      clearParticipantIdentities(false);
+      scanParticipantTiles(true);
+      refreshScreenShareDetection(true);
       isResolutionLocked = true;
       lockedWidth = 1920;
       lockedHeight = 1080;
@@ -2426,6 +2706,8 @@
       const { audioCtx: ctx, audioDestNode: destNode } = ensureAudioCtx();
       if (ctx.state === 'suspended') await ctx.resume();
       // STOP can dispose this startup while AudioContext.resume is pending.
+      if (activeRecordingSession !== session || session.state !== 'starting') return;
+      await warmParticipantIdentities(session);
       if (activeRecordingSession !== session || session.state !== 'starting') return;
       // A failed next-configuration preparation may have left source gains
       // disconnected. Accept startup only after every output is routed again.
@@ -2500,6 +2782,7 @@
       session.state = 'recording';
       isRecording = true;
       updateLocalMicSource();
+      startParticipantIdentityRefresh(session);
       startCompositorLoop(drawCompositorFrame);
       postOut('RECORDING_STARTED', {
         mimeType: session.mimeType, hasVideo: true, hasAudio: stream.getAudioTracks().length > 0,
@@ -2600,6 +2883,12 @@
         if (forceNoScreenShare) {
           postOut('INFO', 'Screenshare ignored — showing background');
         } else {
+          // Forced-off probes may have been retired while receivers stayed live.
+          // Recreate them explicitly; addVideoTrack intentionally deduplicates.
+          allVideoTracks.forEach(track => {
+            if (track.readyState === 'live') probeVideoTrack(track);
+          });
+          refreshScreenShareDetection(true);
           postOut('INFO', 'Screenshare detection re-enabled');
         }
         console.log(`[MeetRecorder] forceNoScreenShare set to: ${forceNoScreenShare}`);
@@ -2623,7 +2912,6 @@
         break;
       case 'STATUS': {
         rescanExistingMediaElements();
-        scanDomForScreenShare(true);
         const participants = [];
         audioTracks.forEach((track, trackId) => {
           const pInfo = getParticipantForTrack(trackId);
@@ -2659,6 +2947,7 @@
           });
         } catch (_) {}
 
+        if (isRecording && participantRoutingDirty) rebuildAudioGraph();
         postOut('STATUS_RESPONSE', {
           isRecording,
           isPaused: mediaRecorder ? mediaRecorder.state === 'paused' : false,
